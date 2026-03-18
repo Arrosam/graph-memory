@@ -270,8 +270,6 @@ const graphMemoryPlugin = {
         messages: any[];
         tokenBudget?: number;
       }) {
-        const budget = tokenBudget ?? 128_000;
-
         const activeNodes = getBySession(db, sessionId);
         const activeEdges = activeNodes.flatMap((n) => [
           ...edgesFrom(db, n.id),
@@ -285,28 +283,24 @@ const graphMemoryPlugin = {
           return { messages, estimatedTokens: 0 };
         }
 
+        // ── 1. 最后一轮完整对话（从最后一个 user 到末尾）──
+        const lastTurn = sliceLastTurn(messages);
+        const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
+
+        // ── 2. 图谱召回全量放入（recall 已 PPR 排序）──
         const { xml, systemPrompt, tokens: gmTokens } = assembleContext(db, {
-          tokenBudget: budget,
+          tokenBudget: 0, // 不再用于截断
           activeNodes,
           activeEdges,
           recalledNodes: rec.nodes,
           recalledEdges: rec.edges,
         });
 
-        const freshTailCount = cfg.freshTailCount ?? 10;
-        let assembled: any[];
-
-        if (messages.length <= freshTailCount) {
-          assembled = messages;
-        } else {
-          assembled = messages.slice(-freshTailCount);
-          const trimmed = messages.length - freshTailCount;
+        if (lastTurn.dropped > 0) {
           api.logger.info(
-            `[graph-memory] assemble: trimmed ${trimmed} msgs → kept ${freshTailCount} tail`,
+            `[graph-memory] assemble: last turn ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok`,
           );
         }
-
-        const repaired = sanitizeToolUseResultPairing(assembled);
 
         let systemPromptAddition: string | undefined;
         if (xml) {
@@ -315,17 +309,9 @@ const graphMemoryPlugin = {
             : xml;
         }
 
-        let tailTokens = 0;
-        for (const msg of repaired) {
-          const content = typeof msg.content === "string"
-            ? msg.content
-            : JSON.stringify(msg.content) ?? "";
-          tailTokens += Math.ceil(content.length / 3);
-        }
-
         return {
           messages: repaired,
-          estimatedTokens: gmTokens + tailTokens,
+          estimatedTokens: gmTokens + lastTurn.tokens,
           ...(systemPromptAddition ? { systemPromptAddition } : {}),
         };
       },
@@ -668,5 +654,53 @@ const graphMemoryPlugin = {
     );
   },
 };
+
+// ─── 取最后一轮完整用户对话 ─────────────────────────────────
+
+function estimateMsgTokens(msg: any): number {
+  const text = typeof msg.content === "string"
+    ? msg.content
+    : JSON.stringify(msg.content ?? "");
+  return Math.ceil(text.length / 3);
+}
+
+/**
+ * 从最后一个 role=user 到消息末尾，完整保留。
+ * tool_use/tool_result 天然配对不会切断。
+ * 超长 tool_result 截断（保头尾砍中间）。
+ */
+function sliceLastTurn(
+  messages: any[],
+): { messages: any[]; tokens: number; dropped: number } {
+  if (!messages.length) {
+    return { messages: [], tokens: 0, dropped: 0 };
+  }
+
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") { lastUserIdx = i; break; }
+  }
+  if (lastUserIdx < 0) lastUserIdx = 0;
+
+  let kept = messages.slice(lastUserIdx);
+  const dropped = lastUserIdx;
+
+  // 截断超长 tool_result
+  const TOOL_MAX = 6000;
+  kept = kept.map((msg: any) => {
+    if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
+    const text = typeof msg.content === "string"
+      ? msg.content
+      : JSON.stringify(msg.content ?? "");
+    if (text.length <= TOOL_MAX) return msg;
+    const head = Math.floor(TOOL_MAX * 0.6);
+    const tail = Math.floor(TOOL_MAX * 0.3);
+    return { ...msg, content: text.slice(0, head) + `\n...[truncated ${text.length - head - tail} chars]...\n` + text.slice(-tail) };
+  });
+
+  let tokens = 0;
+  for (const msg of kept) tokens += estimateMsgTokens(msg);
+  return { messages: kept, tokens, dropped };
+}
 
 export default graphMemoryPlugin;
