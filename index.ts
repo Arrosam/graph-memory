@@ -11,7 +11,7 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
-import { getDb } from "./src/store/db.ts";
+import { getDb, resolveAgentDbPath } from "./src/store/db.ts";
 import {
   saveMessage, getUnextracted,
   markExtracted,
@@ -132,7 +132,8 @@ const graphMemoryPlugin = {
     const { provider, model } = readProviderModel(api.config);
 
     // ── 初始化核心模块 ──────────────────────────────────────
-    const db = getDb(cfg.dbPath);
+    const effectivePath = resolveAgentDbPath(cfg.dbPath, cfg.agentId);
+    const db = getDb(effectivePath);
     const llm = createCompleteFn(provider, model, cfg.llm);
     const recaller = new Recaller(db, cfg);
     const extractor = new Extractor(cfg, llm);
@@ -737,7 +738,9 @@ const graphMemoryPlugin = {
     );
 
     api.logger.info(
-      `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${model}`,
+      `[graph-memory] ready | db=${effectivePath}` +
+      (cfg.agentId ? ` | agent=${cfg.agentId}` : " | mode=shared") +
+      ` | provider=${provider} | model=${model}`,
     );
   },
 };
