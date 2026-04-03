@@ -50,7 +50,6 @@ export function createCompleteFn(
   provider: string,
   model: string,
   llmConfig?: LlmConfig,
-  anthropicApiKey?: string,
 ): CompleteFn {
   return async (system, user) => {
     // ── 路径 A（优先）：pluginConfig.llm 直接调 OpenAI 兼容 API ──
@@ -83,7 +82,8 @@ export function createCompleteFn(
     }
 
     // ── 路径 B：Anthropic API ──────────────────────────────
-    if (!anthropicApiKey) {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) {
       throw new Error(
         "[graph-memory] No LLM available. 在 openclaw.json 的 graph-memory config 中配置 llm.apiKey + llm.baseURL",
       );
