@@ -43,15 +43,16 @@ interface GraphStructure {
   cachedAt: number;
 }
 
-let _cached: GraphStructure | null = null;
+const _cachedGraphs = new Map<DatabaseSyncInstance, GraphStructure>();
 const CACHE_TTL = 30_000; // 30 秒缓存
 
 /**
- * 读取图结构（带缓存）
+ * 读取图结构（带缓存，按 db 实例隔离）
  * compact 会新增节点/边，但 30 秒内的查询共享同一份图结构没问题
  */
 function loadGraph(db: DatabaseSyncInstance): GraphStructure {
-  if (_cached && Date.now() - _cached.cachedAt < CACHE_TTL) return _cached;
+  const existing = _cachedGraphs.get(db);
+  if (existing && Date.now() - existing.cachedAt < CACHE_TTL) return existing;
 
   const nodeRows = db.prepare(
     "SELECT id FROM gm_nodes WHERE status='active'"
@@ -69,13 +70,14 @@ function loadGraph(db: DatabaseSyncInstance): GraphStructure {
     adj.get(e.to_id)!.push(e.from_id);
   }
 
-  _cached = { nodeIds, adj, N: nodeIds.size, cachedAt: Date.now() };
-  return _cached;
+  const fresh = { nodeIds, adj, N: nodeIds.size, cachedAt: Date.now() };
+  _cachedGraphs.set(db, fresh);
+  return fresh;
 }
 
-/** 图结构变化时清除缓存（compact/finalize 后调用） */
-export function invalidateGraphCache(): void {
-  _cached = null;
+/** 图结构变化时清除对应 db 的缓存（compact/finalize 后调用） */
+export function invalidateGraphCache(db: DatabaseSyncInstance): void {
+  _cachedGraphs.delete(db);
 }
 
 // ─── 个性化 PageRank ─────────────────────────────────────────

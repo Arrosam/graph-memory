@@ -189,17 +189,20 @@ export function edgesTo(db: DatabaseSyncInstance, id: string): GmEdge[] {
 
 // ─── FTS5 搜索 ───────────────────────────────────────────────
 
-let _fts5Available: boolean | null = null;
+const _fts5Cache = new Map<DatabaseSyncInstance, boolean>();
 
 function fts5Available(db: DatabaseSyncInstance): boolean {
-  if (_fts5Available !== null) return _fts5Available;
+  const cached = _fts5Cache.get(db);
+  if (cached !== undefined) return cached;
+  let result: boolean;
   try {
     db.prepare("SELECT * FROM gm_nodes_fts LIMIT 0").all();
-    _fts5Available = true;
+    result = true;
   } catch {
-    _fts5Available = false;
+    result = false;
   }
-  return _fts5Available;
+  _fts5Cache.set(db, result);
+  return result;
 }
 
 export function searchNodes(db: DatabaseSyncInstance, query: string, limit = 6): GmNode[] {
