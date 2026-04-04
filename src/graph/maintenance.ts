@@ -37,13 +37,13 @@ export async function runMaintenance(
   const start = Date.now();
 
   // 去重/新增节点后清除图结构缓存
-  invalidateGraphCache();
+  invalidateGraphCache(db);
 
   // 1. 去重
   const dedupResult = dedup(db, cfg);
 
   // 去重可能合并了节点，再清一次缓存
-  if (dedupResult.merged > 0) invalidateGraphCache();
+  if (dedupResult.merged > 0) invalidateGraphCache(db);
 
   // 2. 全局 PageRank（基线）
   const pagerankResult = computeGlobalPageRank(db, cfg);

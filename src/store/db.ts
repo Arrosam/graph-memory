@@ -26,7 +26,7 @@ export function resolveAgentDbPath(dbPath: string, agentId?: string): string {
   const lastSlash = Math.max(dbPath.lastIndexOf("/"), dbPath.lastIndexOf("\\"));
   const dotIdx = dbPath.lastIndexOf(".");
 
-  if (dotIdx > lastSlash && dotIdx !== -1) {
+  if (dotIdx > lastSlash) {
     // Has extension: insert suffix before it
     return `${dbPath.slice(0, dotIdx)}-${safe}${dbPath.slice(dotIdx)}`;
   }
@@ -57,9 +57,14 @@ export function getDb(dbPath: string): DatabaseSyncInstance {
   }
 
   const db = new DatabaseSync(resolved);
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
-  migrate(db);
+  try {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
+    migrate(db);
+  } catch (err) {
+    db.close();
+    throw err;
+  }
   _dbMap.set(resolved, db);
   return db;
 }
