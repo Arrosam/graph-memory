@@ -28,7 +28,7 @@ import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts"
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
-import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
+import { DEFAULT_CONFIG, type GmConfig, normalizeNodeType } from "./src/types.ts";
 
 // ─── 从 OpenClaw config 读 provider/model ────────────────────
 
@@ -93,13 +93,15 @@ function normalizeMessageContent(messages: any[]): any[] {
     const c = msg.content;
     // 已经是数组 → 修复畸形 block（如 { type: "text" } 缺 text 属性）
     if (Array.isArray(c)) {
+      let changed = false;
       const fixed = c.map((block: any) => {
         if (block && typeof block === "object" && block.type === "text" && !("text" in block)) {
+          changed = true;
           return { ...block, text: "" };
         }
         return block;
       });
-      if (fixed !== c) return { ...msg, content: fixed };
+      if (changed) return { ...msg, content: fixed };
       return msg;
     }
     // string → 包装成标准 content block 数组
@@ -217,7 +219,7 @@ const graphMemoryPlugin = {
           markExtracted(db, sessionId, maxTurn);
 
           if (result.nodes.length || result.edges.length) {
-            invalidateGraphCache();
+            invalidateGraphCache(db);
             const nodeDetails = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
             const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.type}]→${e.to}`).join(", ");
             api.logger.info(
@@ -464,7 +466,7 @@ const graphMemoryPlugin = {
 
         if (turns % maintainInterval === 0) {
           try {
-            invalidateGraphCache();
+            invalidateGraphCache(db);
             const pr = computeGlobalPageRank(db, cfg);
             const comm = detectCommunities(db);
             api.logger.info(
@@ -515,6 +517,7 @@ const graphMemoryPlugin = {
         extractChain.clear();
         msgSeq.clear();
         recalled.clear();
+        turnCounter.clear();
       },
     };
 
@@ -649,8 +652,18 @@ const graphMemoryPlugin = {
           p: { name: string; type: string; description: string; content: string; relatedSkill?: string },
         ) {
           const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          const nodeType = normalizeNodeType(p.type);
+          if (!nodeType) {
+            return {
+              content: [{
+                type: "text",
+                text: `类型无效：${p.type}。只允许 TASK、SKILL、EVENT。`,
+              }],
+              details: { error: "invalid_type", type: p.type },
+            };
+          }
           const { node } = upsertNode(db, {
-            type: p.type as any, name: p.name,
+            type: nodeType, name: p.name,
             description: p.description, content: p.content,
           }, sid);
           if (p.relatedSkill) {
