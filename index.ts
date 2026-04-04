@@ -141,13 +141,15 @@ const graphMemoryPlugin = {
     const extractor = new Extractor(cfg, llm);
 
     // ── 初始化 embedding ────────────────────────────────────
-    createEmbedFn(cfg.embedding)
+    createEmbedFn(cfg)
       .then((fn) => {
         if (fn) {
           recaller.setEmbedFn(fn);
           api.logger.info("[graph-memory] vector search ready");
         } else {
-          api.logger.info("[graph-memory] FTS5 search mode (配置 embedding 可启用语义搜索)");
+          api.logger.info(
+            "[graph-memory] FTS5 search mode（向量需 apiKey：可写 embedding 或复用 llm；OpenAI 兼容 baseURL 才能调 /embeddings）",
+          );
         }
       })
       .catch(() => {
