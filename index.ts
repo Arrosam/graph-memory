@@ -134,7 +134,7 @@ const graphMemoryPlugin = {
     const { provider, model } = readProviderModel(api.config);
 
     // ── 初始化核心模块 ──────────────────────────────────────
-    const effectivePath = resolveAgentDbPath(cfg.dbPath, cfg.agentId);
+    const Path = resolveAgentDbPath(cfg.dbPath, cfg.agentId);
     const db = getDb(effectivePath);
     const llm = createCompleteFn(provider, model, cfg.llm);
     const recaller = new Recaller(db, cfg);

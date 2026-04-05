@@ -66,6 +66,7 @@ export function createCompleteFn(
   _provider: string,
   model: string,
   llmConfig?: LlmConfig,
+  anthropicApiKey?: string,
 ): CompleteFn {
   return async (system, user) => {
     if (!llmConfig?.apiKey || !llmConfig?.baseURL) {
