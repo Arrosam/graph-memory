@@ -753,7 +753,7 @@ const graphMemoryPlugin = {
     api.logger.info(
       `[graph-memory] ready | db=${effectivePath}` +
       (cfg.agentId ? ` | agent=${cfg.agentId}` : " | mode=shared") +
-      ` | provider=${provider} | model=${model}`,
+      ` | provider=${provider} | model=${cfg.llm?.model ?? model}`,
     );
   },
 };
