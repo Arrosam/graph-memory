@@ -140,11 +140,50 @@ const graphMemoryPlugin = {
     const recaller = new Recaller(db, cfg);
     const extractor = new Extractor(cfg, llm);
 
+    // ── Per-agent DB routing ────────────────────────────────
+    // OpenClaw calls register() once; runtime hooks provide ctx.agentId per session.
+    // We map sessions to agents and lazily create per-agent DB+Recaller instances.
+    let sharedEmbedFn: ((text: string) => Promise<number[]>) | null = null;
+    const sessionAgentMap = new Map<string, string>();
+    const agentCache = new Map<string, { db: ReturnType<typeof getDb>; recaller: Recaller }>();
+
+    function bindSession(ctx: any): void {
+      const aid = ctx?.agentId?.trim();
+      if (!aid) return;
+      if (ctx.sessionId) sessionAgentMap.set(ctx.sessionId, aid);
+      if (ctx.sessionKey && ctx.sessionKey !== ctx.sessionId) {
+        sessionAgentMap.set(ctx.sessionKey, aid);
+      }
+    }
+
+    function getAgentResources(agentId?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
+      const aid = agentId?.trim();
+      if (!aid || aid === cfg.agentId?.trim()) return { db, recaller };
+      let cached = agentCache.get(aid);
+      if (cached) return cached;
+      const path = resolveAgentDbPath(cfg.dbPath, aid);
+      const agentDb = getDb(path);
+      const agentRecaller = new Recaller(agentDb, cfg);
+      if (sharedEmbedFn) agentRecaller.setEmbedFn(sharedEmbedFn);
+      cached = { db: agentDb, recaller: agentRecaller };
+      agentCache.set(aid, cached);
+      api.logger.info(`[graph-memory] initialized agent DB: ${path} (agent=${aid})`);
+      return cached;
+    }
+
+    function getSessionResources(sessionId: string, sessionKey?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
+      const agentId = (sessionKey ? sessionAgentMap.get(sessionKey) : undefined)
+        ?? sessionAgentMap.get(sessionId);
+      return getAgentResources(agentId);
+    }
+
     // ── 初始化 embedding ────────────────────────────────────
     createEmbedFn(cfg)
       .then((fn) => {
         if (fn) {
+          sharedEmbedFn = fn;
           recaller.setEmbedFn(fn);
+          for (const res of agentCache.values()) res.recaller.setEmbedFn(fn);
           api.logger.info("[graph-memory] vector search ready");
         } else {
           api.logger.info(
@@ -165,32 +204,34 @@ const graphMemoryPlugin = {
     const extractChain = new Map<string, Promise<void>>();
 
     /** 存一条消息到 gm_messages（同步，零 LLM） */
-    function ingestMessage(sessionId: string, message: any): void {
+    function ingestMessage(sessionId: string, message: any, sessionKey?: string): void {
+      const { db: sdb } = getSessionResources(sessionId, sessionKey);
       let seq = msgSeq.get(sessionId);
       if (seq === undefined) {
         // 首次入库：从数据库读取当前最大 turn_index，避免重启后 turn_index 重叠
-        const row = db.prepare(
+        const row = sdb.prepare(
           "SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=?"
         ).get(sessionId) as any;
         seq = Number(row?.maxTurn) || 0;
       }
       seq += 1;
       msgSeq.set(sessionId, seq);
-      saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
+      saveMessage(sdb, sessionId, seq, message.role ?? "unknown", message);
     }
 
     /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
-    async function runTurnExtract(sessionId: string, newMessages: any[]): Promise<void> {
+    async function runTurnExtract(sessionId: string, newMessages: any[], sessionKey?: string): Promise<void> {
       if (!newMessages.length) return;
 
       // Promise chain：上一次提取完了才跑下一次，不会跳过
       const prev = extractChain.get(sessionId) ?? Promise.resolve();
       const next = prev.then(async () => {
         try {
-          const msgs = getUnextracted(db, sessionId, 50);
+          const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+          const msgs = getUnextracted(sdb, sessionId, 50);
           if (!msgs.length) return;
 
-          const existing = getBySession(db, sessionId).map((n) => n.name);
+          const existing = getBySession(sdb, sessionId).map((n) => n.name);
           const result = await extractor.extract({
             messages: msgs,
             existingNames: existing,
@@ -198,19 +239,19 @@ const graphMemoryPlugin = {
 
           const nameToId = new Map<string, string>();
           for (const nc of result.nodes) {
-            const { node } = upsertNode(db, {
+            const { node } = upsertNode(sdb, {
               type: nc.type, name: nc.name,
               description: nc.description, content: nc.content,
             }, sessionId);
             nameToId.set(node.name, node.id);
-            recaller.syncEmbed(node).catch(() => {});
+            sRecaller.syncEmbed(node).catch(() => {});
           }
 
           for (const ec of result.edges) {
-            const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
-            const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
+            const fromId = nameToId.get(ec.from) ?? findByName(sdb, ec.from)?.id;
+            const toId = nameToId.get(ec.to) ?? findByName(sdb, ec.to)?.id;
             if (fromId && toId) {
-              upsertEdge(db, {
+              upsertEdge(sdb, {
                 fromId, toId, type: ec.type,
                 instruction: ec.instruction, condition: ec.condition, sessionId,
               });
@@ -218,10 +259,10 @@ const graphMemoryPlugin = {
           }
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-          markExtracted(db, sessionId, maxTurn);
+          markExtracted(sdb, sessionId, maxTurn);
 
           if (result.nodes.length || result.edges.length) {
-            invalidateGraphCache(db);
+            invalidateGraphCache(sdb);
             const nodeDetails = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
             const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.type}]→${e.to}`).join(", ");
             api.logger.info(
@@ -237,20 +278,27 @@ const graphMemoryPlugin = {
       return next;
     }
 
+    // ── session_start：bind agent identity ────────────────────
+
+    api.on("session_start", async (_event: any, ctx: any) => {
+      bindSession(ctx);
+    });
+
     // ── before_prompt_build：召回 ────────────────────────────
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       try {
+        bindSession(ctx);
+
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
         const prompt = cleanPrompt(rawPrompt);
         if (!prompt) return;
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
-        const sid = ctx?.sessionId ?? ctx?.sessionKey;
-
         api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
-        const res = await recaller.recall(prompt);
+        const { recaller: agentRecaller } = getAgentResources(ctx?.agentId);
+        const res = await agentRecaller.recall(prompt);
         if (res.nodes.length) {
           if (ctx?.sessionId) recalled.set(ctx.sessionId, res);
           if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
@@ -280,33 +328,38 @@ const graphMemoryPlugin = {
 
       async ingest({
         sessionId,
+        sessionKey,
         message,
         isHeartbeat,
       }: {
         sessionId: string;
+        sessionKey?: string;
         message: any;
         isHeartbeat?: boolean;
       }) {
         if (isHeartbeat) return { ingested: false };
-        ingestMessage(sessionId, message);
+        ingestMessage(sessionId, message, sessionKey);
         return { ingested: true };
       },
 
       async assemble({
         sessionId,
+        sessionKey,
         messages,
         tokenBudget,
         prompt,
       }: {
         sessionId: string;
+        sessionKey?: string;
         messages: any[];
         tokenBudget?: number;
         prompt?: string;  // Added in OpenClaw 2026.03.28: prompt-aware retrieval
       }) {
-        const activeNodes = getBySession(db, sessionId);
+        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+        const activeNodes = getBySession(sdb, sessionId);
         const activeEdges = activeNodes.flatMap((n) => [
-          ...edgesFrom(db, n.id),
-          ...edgesTo(db, n.id),
+          ...edgesFrom(sdb, n.id),
+          ...edgesTo(sdb, n.id),
         ]);
 
         // OpenClaw 2026.03.28: use the prompt for a fresh, accurate recall
@@ -317,7 +370,7 @@ const graphMemoryPlugin = {
           const cleaned = cleanPrompt(prompt);
           if (cleaned) {
             try {
-              const freshRec = await recaller.recall(cleaned);
+              const freshRec = await sRecaller.recall(cleaned);
               if (freshRec.nodes.length) {
                 rec = freshRec;
                 recalled.set(sessionId, freshRec);
@@ -339,7 +392,7 @@ const graphMemoryPlugin = {
         const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
         // ── 2. 图谱 + 溯源 ─────────────────────────────
-        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, {
+        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(sdb, {
           tokenBudget: 0,
           activeNodes,
           activeEdges,
@@ -371,24 +424,27 @@ const graphMemoryPlugin = {
 
       async compact({
         sessionId,
+        sessionKey,
         force,
         currentTokenCount,
       }: {
         sessionId: string;
+        sessionKey?: string;
         sessionFile: string;
         tokenBudget?: number;
         force?: boolean;
         currentTokenCount?: number;
       }) {
+        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
-        const msgs = getUnextracted(db, sessionId, 50);
+        const msgs = getUnextracted(sdb, sessionId, 50);
 
         if (!msgs.length) {
           return { ok: true, compacted: false, reason: "no messages" };
         }
 
         try {
-          const existing = getBySession(db, sessionId).map((n) => n.name);
+          const existing = getBySession(sdb, sessionId).map((n) => n.name);
           const result = await extractor.extract({
             messages: msgs,
             existingNames: existing,
@@ -396,19 +452,19 @@ const graphMemoryPlugin = {
 
           const nameToId = new Map<string, string>();
           for (const nc of result.nodes) {
-            const { node } = upsertNode(db, {
+            const { node } = upsertNode(sdb, {
               type: nc.type, name: nc.name,
               description: nc.description, content: nc.content,
             }, sessionId);
             nameToId.set(node.name, node.id);
-            recaller.syncEmbed(node).catch(() => {});
+            sRecaller.syncEmbed(node).catch(() => {});
           }
 
           for (const ec of result.edges) {
-            const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
-            const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
+            const fromId = nameToId.get(ec.from) ?? findByName(sdb, ec.from)?.id;
+            const toId = nameToId.get(ec.to) ?? findByName(sdb, ec.to)?.id;
             if (fromId && toId) {
-              upsertEdge(db, {
+              upsertEdge(sdb, {
                 fromId, toId, type: ec.type,
                 instruction: ec.instruction, condition: ec.condition, sessionId,
               });
@@ -416,7 +472,7 @@ const graphMemoryPlugin = {
           }
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-          markExtracted(db, sessionId, maxTurn);
+          markExtracted(sdb, sessionId, maxTurn);
 
           return {
             ok: true, compacted: true,
@@ -433,11 +489,13 @@ const graphMemoryPlugin = {
 
       async afterTurn({
         sessionId,
+        sessionKey,
         messages,
         prePromptMessageCount,
         isHeartbeat,
       }: {
         sessionId: string;
+        sessionKey?: string;
         sessionFile: string;
         messages: any[];
         prePromptMessageCount: number;
@@ -457,7 +515,7 @@ const graphMemoryPlugin = {
         );
 
         // ★ 每轮直接提取
-        runTurnExtract(sessionId, newMessages).catch((err) => {
+        runTurnExtract(sessionId, newMessages, sessionKey).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
 
@@ -468,9 +526,10 @@ const graphMemoryPlugin = {
 
         if (turns % maintainInterval === 0) {
           try {
-            invalidateGraphCache(db);
-            const pr = computeGlobalPageRank(db, cfg);
-            const comm = detectCommunities(db);
+            const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+            invalidateGraphCache(sdb);
+            const pr = computeGlobalPageRank(sdb, cfg);
+            const comm = detectCommunities(sdb);
             api.logger.info(
               `[graph-memory] periodic maintenance (turn ${turns}): ` +
               `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}, ` +
@@ -482,8 +541,8 @@ const graphMemoryPlugin = {
               (async () => {
                 try {
                   const { summarizeCommunities } = await import("./src/graph/community.ts");
-                  const embedFn = (recaller as any).embed ?? undefined;
-                  const summaries = await summarizeCommunities(db, comm.communities, llm, embedFn);
+                  const embedFn = (sRecaller as any).embed ?? undefined;
+                  const summaries = await summarizeCommunities(sdb, comm.communities, llm, embedFn);
                   api.logger.info(
                     `[graph-memory] community summaries refreshed: ${summaries} summaries`,
                   );
@@ -507,12 +566,19 @@ const graphMemoryPlugin = {
       }) {
         const rec = recalled.get(parentSessionKey);
         if (rec) recalled.set(childSessionKey, rec);
-        return { rollback: () => { recalled.delete(childSessionKey); } };
+        // Propagate agent binding to child session
+        const parentAgent = sessionAgentMap.get(parentSessionKey);
+        if (parentAgent) sessionAgentMap.set(childSessionKey, parentAgent);
+        return { rollback: () => {
+          recalled.delete(childSessionKey);
+          sessionAgentMap.delete(childSessionKey);
+        } };
       },
 
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
         recalled.delete(childSessionKey);
         msgSeq.delete(childSessionKey);
+        sessionAgentMap.delete(childSessionKey);
       },
 
       async dispose() {
@@ -520,6 +586,8 @@ const graphMemoryPlugin = {
         msgSeq.clear();
         recalled.clear();
         turnCounter.clear();
+        sessionAgentMap.clear();
+        agentCache.clear();
       },
     };
 
@@ -528,6 +596,7 @@ const graphMemoryPlugin = {
     // ── session_end：finalize + 图维护 ──────────────────────
 
     api.on("session_end", async (event: any, ctx: any) => {
+      bindSession(ctx);
       const sid =
         ctx?.sessionKey ??
         ctx?.sessionId ??
@@ -536,10 +605,11 @@ const graphMemoryPlugin = {
       if (!sid) return;
 
       try {
-        const nodes = getBySession(db, sid);
+        const { db: sdb, recaller: sRecaller } = getAgentResources(ctx?.agentId);
+        const nodes = getBySession(sdb, sid);
         if (nodes.length) {
           const summary = (
-            db.prepare(
+            sdb.prepare(
               "SELECT name, type, validated_count, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 20",
             ).all() as any[]
           )
@@ -553,27 +623,27 @@ const graphMemoryPlugin = {
 
           for (const nc of fin.promotedSkills) {
             if (nc.name && nc.content) {
-              upsertNode(db, {
+              upsertNode(sdb, {
                 type: "SKILL", name: nc.name,
                 description: nc.description ?? "", content: nc.content,
               }, sid);
             }
           }
           for (const ec of fin.newEdges) {
-            const fromId = findByName(db, ec.from)?.id;
-            const toId = findByName(db, ec.to)?.id;
+            const fromId = findByName(sdb, ec.from)?.id;
+            const toId = findByName(sdb, ec.to)?.id;
             if (fromId && toId) {
-              upsertEdge(db, {
+              upsertEdge(sdb, {
                 fromId, toId, type: ec.type,
                 instruction: ec.instruction, sessionId: sid,
               });
             }
           }
-          for (const id of fin.invalidations) deprecate(db, id);
+          for (const id of fin.invalidations) deprecate(sdb, id);
         }
 
-        const embedFn = (recaller as any).embed ?? undefined;
-        const result = await runMaintenance(db, cfg, llm, embedFn);
+        const embedFn = (sRecaller as any).embed ?? undefined;
+        const result = await runMaintenance(sdb, cfg, llm, embedFn);
         api.logger.info(
           `[graph-memory] maintenance: ${result.durationMs}ms, ` +
           `dedup=${result.dedup.merged}, ` +
@@ -588,13 +658,15 @@ const graphMemoryPlugin = {
         msgSeq.delete(sid);
         recalled.delete(sid);
         turnCounter.delete(sid);
+        if (ctx?.sessionId) sessionAgentMap.delete(ctx.sessionId);
+        if (ctx?.sessionKey) sessionAgentMap.delete(ctx.sessionKey);
       }
     });
 
     // ── Agent Tools（改名 gm_*）──────────────────────────────
 
     api.registerTool(
-      (_ctx: any) => ({
+      (ctx: any) => ({
         name: "gm_search",
         label: "Search Graph Memory",
         description: "搜索知识图谱中的相关经验、技能和解决方案。遇到可能之前解决过的问题时调用。",
@@ -603,7 +675,8 @@ const graphMemoryPlugin = {
         }),
         async execute(_toolCallId: string, params: { query: string }) {
           const { query } = params;
-          const res = await recaller.recall(query);
+          const { recaller: tRecaller } = getAgentResources(ctx?.agentId);
+          const res = await tRecaller.recall(query);
           if (!res.nodes.length) {
             return {
               content: [{ type: "text", text: "图谱中未找到相关记录。" }],
@@ -654,6 +727,7 @@ const graphMemoryPlugin = {
           p: { name: string; type: string; description: string; content: string; relatedSkill?: string },
         ) {
           const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          const { db: tdb, recaller: tRecaller } = getAgentResources(ctx?.agentId);
           const nodeType = normalizeNodeType(p.type);
           if (!nodeType) {
             return {
@@ -664,20 +738,20 @@ const graphMemoryPlugin = {
               details: { error: "invalid_type", type: p.type },
             };
           }
-          const { node } = upsertNode(db, {
+          const { node } = upsertNode(tdb, {
             type: nodeType, name: p.name,
             description: p.description, content: p.content,
           }, sid);
           if (p.relatedSkill) {
-            const rel = findByName(db, p.relatedSkill);
+            const rel = findByName(tdb, p.relatedSkill);
             if (rel) {
-              upsertEdge(db, {
+              upsertEdge(tdb, {
                 fromId: node.id, toId: rel.id, type: "SOLVED_BY",
                 instruction: `关联 ${p.relatedSkill}`, sessionId: sid,
               });
             }
           }
-          recaller.syncEmbed(node).catch(() => {});
+          tRecaller.syncEmbed(node).catch(() => {});
           return {
             content: [{ type: "text", text: `已记录：${node.name} (${node.type})` }],
             details: { name: node.name, type: node.type },
@@ -688,14 +762,15 @@ const graphMemoryPlugin = {
     );
 
     api.registerTool(
-      (_ctx: any) => ({
+      (ctx: any) => ({
         name: "gm_stats",
         label: "Graph Memory Stats",
         description: "查看知识图谱的统计信息：节点数、边数、社区数、PageRank Top 节点。",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
-          const stats = getStats(db);
-          const topPr = (db.prepare(
+          const { db: tdb } = getAgentResources(ctx?.agentId);
+          const stats = getStats(tdb);
+          const topPr = (tdb.prepare(
             "SELECT name, type, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 5"
           ).all() as any[]);
 
@@ -717,14 +792,15 @@ const graphMemoryPlugin = {
     );
 
     api.registerTool(
-      (_ctx: any) => ({
+      (ctx: any) => ({
         name: "gm_maintain",
         label: "Graph Memory Maintenance",
         description: "手动触发图维护：运行去重、PageRank 重算、社区检测。通常 session_end 时自动运行，这个工具用于手动触发。",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: any) {
-          const embedFn = (recaller as any).embed ?? undefined;
-          const result = await runMaintenance(db, cfg, llm, embedFn);
+          const { db: tdb, recaller: tRecaller } = getAgentResources(ctx?.agentId);
+          const embedFn = (tRecaller as any).embed ?? undefined;
+          const result = await runMaintenance(tdb, cfg, llm, embedFn);
           const text = [
             `图维护完成（${result.durationMs}ms）`,
             `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
