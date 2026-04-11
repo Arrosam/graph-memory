@@ -63,8 +63,12 @@ async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs
 
 // ─── EmbedFn 工厂 ───────────────────────────────────────────
 
-export async function createEmbedFn(cfg: GmConfig): Promise<EmbedFn | null> {
+export async function createEmbedFn(cfg: GmConfig, log?: (msg: string) => void): Promise<EmbedFn | null> {
   const resolved = resolveEffectiveEmbeddingConfig(cfg);
+  const _log = log ?? ((m: string) => console.log(m));
+  _log(
+    `[graph-memory] embedding config resolve: embedding=${JSON.stringify({ apiKey: cfg.embedding?.apiKey ? "***" : undefined, baseURL: cfg.embedding?.baseURL, model: cfg.embedding?.model })} → effective=${resolved ? JSON.stringify({ apiKey: "***", baseURL: resolved.baseURL, model: resolved.model }) : "null (no apiKey)"}`,
+  );
   if (!resolved || !resolved.apiKey) return null;
 
   const apiKey     = resolved.apiKey;

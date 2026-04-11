@@ -134,15 +134,13 @@ const graphMemoryPlugin = {
     const { provider, model } = readProviderModel(api.config);
 
     // ── 初始化核心模块 ──────────────────────────────────────
-    const effectivePath = resolveAgentDbPath(cfg.dbPath, cfg.agentId);
-    const db = getDb(effectivePath);
     const llm = createCompleteFn(provider, model, cfg.llm);
-    const recaller = new Recaller(db, cfg);
     const extractor = new Extractor(cfg, llm);
 
     // ── Per-agent DB routing ────────────────────────────────
     // OpenClaw calls register() once; runtime hooks provide ctx.agentId per session.
-    // We map sessions to agents and lazily create per-agent DB+Recaller instances.
+    // All DB+Recaller instances are created lazily on first use, keyed by agentId.
+    // This avoids opening the unified DB when per-agent DBs are in use.
     let sharedEmbedFn: ((text: string) => Promise<number[]>) | null = null;
     const sessionAgentMap = new Map<string, string>();
     const agentCache = new Map<string, { db: ReturnType<typeof getDb>; recaller: Recaller }>();
@@ -157,17 +155,17 @@ const graphMemoryPlugin = {
     }
 
     function getAgentResources(agentId?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
-      const aid = agentId?.trim();
-      if (!aid || aid === cfg.agentId?.trim()) return { db, recaller };
+      // Resolve effective agentId: runtime agentId → config agentId → empty (unified)
+      const aid = agentId?.trim() || cfg.agentId?.trim() || "";
       let cached = agentCache.get(aid);
       if (cached) return cached;
-      const path = resolveAgentDbPath(cfg.dbPath, aid);
+      const path = resolveAgentDbPath(cfg.dbPath, aid || undefined);
       const agentDb = getDb(path);
       const agentRecaller = new Recaller(agentDb, cfg);
       if (sharedEmbedFn) agentRecaller.setEmbedFn(sharedEmbedFn);
       cached = { db: agentDb, recaller: agentRecaller };
       agentCache.set(aid, cached);
-      api.logger.info(`[graph-memory] initialized agent DB: ${path} (agent=${aid})`);
+      api.logger.info(`[graph-memory] initialized DB: ${path}` + (aid ? ` (agent=${aid})` : " (shared)"));
       return cached;
     }
 
@@ -178,11 +176,10 @@ const graphMemoryPlugin = {
     }
 
     // ── 初始化 embedding ────────────────────────────────────
-    createEmbedFn(cfg)
+    createEmbedFn(cfg, (m) => api.logger.info(m))
       .then((fn) => {
         if (fn) {
           sharedEmbedFn = fn;
-          recaller.setEmbedFn(fn);
           for (const res of agentCache.values()) res.recaller.setEmbedFn(fn);
           api.logger.info("[graph-memory] vector search ready");
         } else {
@@ -827,8 +824,7 @@ const graphMemoryPlugin = {
     );
 
     api.logger.info(
-      `[graph-memory] ready | db=${effectivePath}` +
-      (cfg.agentId ? ` | agent=${cfg.agentId}` : " | mode=shared") +
+      `[graph-memory] ready | db=${cfg.dbPath} (lazy, per-agent)` +
       ` | provider=${provider} | model=${cfg.llm?.model ?? model}`,
     );
   },
