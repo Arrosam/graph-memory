@@ -145,6 +145,14 @@ const graphMemoryPlugin = {
     const sessionAgentMap = new Map<string, string>();
     const agentCache = new Map<string, { db: ReturnType<typeof getDb>; recaller: Recaller }>();
 
+    /** Try to extract agentId from an OpenClaw sessionKey.
+     *  Known patterns: "agent:<id>:…", "<channel>:<account>:agent:<id>:…" */
+    function parseAgentIdFromKey(sessionKey?: string): string | undefined {
+      if (!sessionKey) return undefined;
+      const m = sessionKey.match(/(?:^|:)agent:([^:]+)/);
+      return m?.[1]?.trim() || undefined;
+    }
+
     function bindSession(ctx: any): void {
       const aid = ctx?.agentId?.trim();
       if (!aid) return;
@@ -152,6 +160,15 @@ const graphMemoryPlugin = {
       if (ctx.sessionKey && ctx.sessionKey !== ctx.sessionId) {
         sessionAgentMap.set(ctx.sessionKey, aid);
       }
+    }
+
+    /** Resolve agentId from: explicit param → sessionAgentMap → sessionKey pattern → config fallback */
+    function resolveAgentId(sessionId?: string, sessionKey?: string, explicitAgentId?: string): string | undefined {
+      return explicitAgentId?.trim()
+        || (sessionKey ? sessionAgentMap.get(sessionKey) : undefined)
+        || (sessionId ? sessionAgentMap.get(sessionId) : undefined)
+        || parseAgentIdFromKey(sessionKey)
+        || undefined;
     }
 
     function getAgentResources(agentId?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
@@ -169,10 +186,14 @@ const graphMemoryPlugin = {
       return cached;
     }
 
-    function getSessionResources(sessionId: string, sessionKey?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
-      const agentId = (sessionKey ? sessionAgentMap.get(sessionKey) : undefined)
-        ?? sessionAgentMap.get(sessionId);
-      return getAgentResources(agentId);
+    function getSessionResources(sessionId: string, sessionKey?: string, agentId?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
+      const resolved = resolveAgentId(sessionId, sessionKey, agentId);
+      // If we discovered agentId late (e.g. from sessionKey pattern), cache the mapping
+      if (resolved && !sessionAgentMap.has(sessionId)) {
+        sessionAgentMap.set(sessionId, resolved);
+        if (sessionKey && sessionKey !== sessionId) sessionAgentMap.set(sessionKey, resolved);
+      }
+      return getAgentResources(resolved);
     }
 
     // ── 初始化 embedding ────────────────────────────────────
@@ -201,8 +222,8 @@ const graphMemoryPlugin = {
     const extractChain = new Map<string, Promise<void>>();
 
     /** 存一条消息到 gm_messages（同步，零 LLM） */
-    function ingestMessage(sessionId: string, message: any, sessionKey?: string): void {
-      const { db: sdb } = getSessionResources(sessionId, sessionKey);
+    function ingestMessage(sessionId: string, message: any, sessionKey?: string, agentId?: string): void {
+      const { db: sdb } = getSessionResources(sessionId, sessionKey, agentId);
       let seq = msgSeq.get(sessionId);
       if (seq === undefined) {
         // 首次入库：从数据库读取当前最大 turn_index，避免重启后 turn_index 重叠
@@ -217,14 +238,14 @@ const graphMemoryPlugin = {
     }
 
     /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
-    async function runTurnExtract(sessionId: string, newMessages: any[], sessionKey?: string): Promise<void> {
+    async function runTurnExtract(sessionId: string, newMessages: any[], sessionKey?: string, agentId?: string): Promise<void> {
       if (!newMessages.length) return;
 
       // Promise chain：上一次提取完了才跑下一次，不会跳过
       const prev = extractChain.get(sessionId) ?? Promise.resolve();
       const next = prev.then(async () => {
         try {
-          const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+          const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
           const msgs = getUnextracted(sdb, sessionId, 50);
           if (!msgs.length) return;
 
@@ -327,7 +348,13 @@ const graphMemoryPlugin = {
         ownsCompaction: true,
       },
 
-      async bootstrap({ sessionId }: { sessionId: string }) {
+      async bootstrap({ sessionId, sessionKey, agentId, ...rest }: { sessionId: string; sessionKey?: string; agentId?: string; [k: string]: any }) {
+        // Eagerly bind if OpenClaw passes agentId in bootstrap
+        if (agentId) {
+          const aid = agentId.trim();
+          if (aid && sessionId) sessionAgentMap.set(sessionId, aid);
+          if (aid && sessionKey && sessionKey !== sessionId) sessionAgentMap.set(sessionKey, aid);
+        }
         return { bootstrapped: true };
       },
 
@@ -336,14 +363,25 @@ const graphMemoryPlugin = {
         sessionKey,
         message,
         isHeartbeat,
+        agentId,
+        ...rest
       }: {
         sessionId: string;
         sessionKey?: string;
         message: any;
         isHeartbeat?: boolean;
+        agentId?: string;
+        [k: string]: any;
       }) {
         if (isHeartbeat) return { ingested: false };
-        ingestMessage(sessionId, message, sessionKey);
+        // Log once per session to diagnose agentId availability in ContextEngine methods
+        if (!sessionAgentMap.has(sessionId)) {
+          const extraKeys = Object.keys(rest).join(",");
+          api.logger.info(
+            `[graph-memory] ingest first-seen sid=${sessionId.slice(0, 8)} agentId=${agentId ?? "∅"} sessionKey=${(sessionKey ?? "∅").slice(0, 30)} extraKeys=[${extraKeys}]`,
+          );
+        }
+        ingestMessage(sessionId, message, sessionKey, agentId);
         return { ingested: true };
       },
 
@@ -353,14 +391,18 @@ const graphMemoryPlugin = {
         messages,
         tokenBudget,
         prompt,
+        agentId,
+        ...rest
       }: {
         sessionId: string;
         sessionKey?: string;
         messages: any[];
         tokenBudget?: number;
         prompt?: string;  // Added in OpenClaw 2026.03.28: prompt-aware retrieval
+        agentId?: string;
+        [k: string]: any;
       }) {
-        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
         const activeNodes = getBySession(sdb, sessionId);
         const activeEdges = activeNodes.flatMap((n) => [
           ...edgesFrom(sdb, n.id),
@@ -432,6 +474,8 @@ const graphMemoryPlugin = {
         sessionKey,
         force,
         currentTokenCount,
+        agentId,
+        ...rest
       }: {
         sessionId: string;
         sessionKey?: string;
@@ -439,8 +483,10 @@ const graphMemoryPlugin = {
         tokenBudget?: number;
         force?: boolean;
         currentTokenCount?: number;
+        agentId?: string;
+        [k: string]: any;
       }) {
-        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
         // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
         const msgs = getUnextracted(sdb, sessionId, 50);
 
@@ -498,6 +544,8 @@ const graphMemoryPlugin = {
         messages,
         prePromptMessageCount,
         isHeartbeat,
+        agentId,
+        ...rest
       }: {
         sessionId: string;
         sessionKey?: string;
@@ -507,6 +555,8 @@ const graphMemoryPlugin = {
         autoCompactionSummary?: string;
         isHeartbeat?: boolean;
         tokenBudget?: number;
+        agentId?: string;
+        [k: string]: any;
       }) {
         if (isHeartbeat) return;
 
@@ -520,7 +570,7 @@ const graphMemoryPlugin = {
         );
 
         // ★ 每轮直接提取
-        runTurnExtract(sessionId, newMessages, sessionKey).catch((err) => {
+        runTurnExtract(sessionId, newMessages, sessionKey, agentId).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
 
@@ -531,7 +581,7 @@ const graphMemoryPlugin = {
 
         if (turns % maintainInterval === 0) {
           try {
-            const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey);
+            const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
             invalidateGraphCache(sdb);
             const pr = computeGlobalPageRank(sdb, cfg);
             const comm = detectCommunities(sdb);
