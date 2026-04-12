@@ -278,6 +278,9 @@ const graphMemoryPlugin = {
     // ── session_start：bind agent identity ────────────────────
 
     api.on("session_start", async (_event: any, ctx: any) => {
+      api.logger.info(
+        `[graph-memory] session_start ctx keys=[${ctx ? Object.keys(ctx).join(",") : "null"}] agentId=${ctx?.agentId ?? "∅"} sessionId=${(ctx?.sessionId ?? "∅").slice(0, 8)} sessionKey=${(ctx?.sessionKey ?? "∅").slice(0, 20)}`,
+      );
       bindSession(ctx);
     });
 
@@ -285,6 +288,11 @@ const graphMemoryPlugin = {
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       try {
+        if (!sessionAgentMap.has(ctx?.sessionId)) {
+          api.logger.info(
+            `[graph-memory] before_prompt_build ctx keys=[${ctx ? Object.keys(ctx).join(",") : "null"}] agentId=${ctx?.agentId ?? "∅"} sessionId=${(ctx?.sessionId ?? "∅").slice(0, 8)}`,
+          );
+        }
         bindSession(ctx);
 
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
