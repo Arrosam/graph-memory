@@ -50,6 +50,11 @@
         "default": 20,
         "description": "PageRank 迭代次数"
       },
+      "compactWindowPercent": {
+        "type": "number",
+        "default": 0.75,
+        "description": "Context window 使用率阈值 (0-1)。超过后从最早一轮开始提取至知识图谱并从 context 中移除。例如 0.75 表示 context 用到 75% 时开始压缩。"
+      },
       "embedding": {
         "type": "object",
         "description": "可选：向量搜索。未填 apiKey/baseURL 时复用 llm 的同字段（同一 OpenAI 兼容网关下一处配置即可）。LLM 用 Anthropic 时须在此单独写 OpenAI 兼容 baseURL 才能走向量。",

@@ -148,6 +148,8 @@ export interface GmConfig {
   pagerankDamping: number;
   /** PageRank 迭代次数 */
   pagerankIterations: number;
+  /** Context window 使用率阈值 (0-1)，超过后开始从最早一轮压缩。默认 0.75 */
+  compactWindowPercent: number;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
@@ -159,4 +161,5 @@ export const DEFAULT_CONFIG: GmConfig = {
   dedupThreshold: 0.90,
   pagerankDamping: 0.85,
   pagerankIterations: 20,
+  compactWindowPercent: 0.75,
 };

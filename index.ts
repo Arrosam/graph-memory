@@ -345,7 +345,7 @@ const graphMemoryPlugin = {
       info: {
         id: "graph-memory",
         name: "Graph Memory",
-        ownsCompaction: true,
+        ownsCompaction: true,  // we handle compaction: extract oldest turn → remove from context
       },
 
       async bootstrap({ sessionId, sessionKey, agentId, ...rest }: { sessionId: string; sessionKey?: string; agentId?: string; [k: string]: any }) {
@@ -431,11 +431,17 @@ const graphMemoryPlugin = {
         const totalGmNodes = activeNodes.length + rec.nodes.length;
 
         if (totalGmNodes === 0) {
-          return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
+          // 即使没有图谱节点，也要按 token 预算裁剪
+          const pct = cfg.compactWindowPercent ?? 0.75;
+          const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
+          const trimmed = sliceLastTurn(messages, maxTok);
+          return { messages: normalizeMessageContent(trimmed.messages), estimatedTokens: trimmed.tokens };
         }
 
-        // ── 1. 最后一轮完整对话 ─────────────────────────
-        const lastTurn = sliceLastTurn(messages);
+        // ── 1. 按 token 预算裁剪对话轮 ─────────────────
+        const pct = cfg.compactWindowPercent ?? 0.75;
+        const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
+        const lastTurn = sliceLastTurn(messages, maxTok);
         const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
         // ── 2. 图谱 + 溯源 ─────────────────────────────
@@ -450,7 +456,9 @@ const graphMemoryPlugin = {
         if (lastTurn.dropped > 0 || episodicTokens > 0) {
           api.logger.info(
             `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
-            `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok` +
+            `dropped ${lastTurn.dropped} older msgs` +
+            (maxTok ? ` (budget ${maxTok} tok, ${Math.round(pct * 100)}% of ${tokenBudget})` : "") +
+            `, graph ~${gmTokens} tok` +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
         }
@@ -472,7 +480,6 @@ const graphMemoryPlugin = {
       async compact({
         sessionId,
         sessionKey,
-        force,
         currentTokenCount,
         agentId,
         ...rest
@@ -487,11 +494,11 @@ const graphMemoryPlugin = {
         [k: string]: any;
       }) {
         const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
-        // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
-        const msgs = getUnextracted(sdb, sessionId, 50);
 
+        // 把未提取的消息存入图谱（确保被 assemble 裁剪掉的轮不丢知识）
+        const msgs = getUnextracted(sdb, sessionId, 50);
         if (!msgs.length) {
-          return { ok: true, compacted: false, reason: "no messages" };
+          return { ok: true, compacted: true, result: { summary: "no unextracted messages", tokensBefore: currentTokenCount ?? 0 } };
         }
 
         try {
@@ -524,6 +531,10 @@ const graphMemoryPlugin = {
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           markExtracted(sdb, sessionId, maxTurn);
+
+          api.logger.info(
+            `[graph-memory] compact: extracted ${result.nodes.length} nodes, ${result.edges.length} edges (assemble handles context trimming)`,
+          );
 
           return {
             ok: true, compacted: true,
@@ -882,7 +893,7 @@ const graphMemoryPlugin = {
     );
 
     api.logger.info(
-      `[graph-memory] ready | db=${cfg.dbPath} (lazy, per-agent)` +
+      `[graph-memory] ready | dbBase=${cfg.dbPath} (per-agent: <base>-{agentId}.db)` +
       ` | provider=${provider} | model=${cfg.llm?.model ?? model}`,
     );
   },
@@ -897,7 +908,8 @@ function estimateMsgTokens(msg: any): number {
   return Math.ceil(text.length / 3);
 }
 
-const KEEP_TURNS = 5;  // 保留最近 5 轮用户交互
+const MIN_KEEP_TURNS = 1;   // 至少保留最新 1 轮
+const MAX_KEEP_TURNS = 10;  // 最多保留 10 轮
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
@@ -944,19 +956,29 @@ function extractUserText(msg: any): string {
   return raw;
 }
 
+/**
+ * 按 token 预算动态保留最近 N 轮对话。
+ *
+ * - 最新 1 轮：完整保留（含 tool_result，截断超长的）
+ * - 更早的轮：只保留 user + assistant 纯文本（去掉 tool schema / thinking）
+ * - 从最早轮开始逐轮裁剪，直到 token 预算内或只剩 1 轮
+ *
+ * @param maxTokens 0 或 undefined 表示不限制，使用 MAX_KEEP_TURNS 兜底
+ */
 function sliceLastTurn(
   messages: any[],
+  maxTokens?: number,
 ): { messages: any[]; tokens: number; dropped: number } {
   if (!messages.length) {
     return { messages: [], tokens: 0, dropped: 0 };
   }
 
-  // ── 找到最近 N 个 user 消息的位置 ────────────────────
+  // ── 识别所有 user 轮的起始位置（倒序）────────────────
   const userIndices: number[] = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
       userIndices.push(i);
-      if (userIndices.length >= KEEP_TURNS) break;
+      if (userIndices.length >= MAX_KEEP_TURNS) break;
     }
   }
   if (!userIndices.length) {
@@ -964,16 +986,11 @@ function sliceLastTurn(
   }
 
   // userIndices 是倒序的：[最新user, ..., 最早user]
-  // 最后一轮的 user 位置
   const lastTurnUserIdx = userIndices[0];
 
-  // ── 最后 1 轮：完整保留（含 toolResult，Agent 需要最新执行结果）──
-  let lastTurnMsgs = messages.slice(lastTurnUserIdx);
-  const lastTurnTotal = lastTurnMsgs.length;
-
-  // 截断超长 tool_result
+  // ── 最新 1 轮：完整保留（截断超长 tool_result）──────
   const TOOL_MAX = 6000;
-  lastTurnMsgs = lastTurnMsgs.map((msg: any) => {
+  const lastTurnMsgs = messages.slice(lastTurnUserIdx).map((msg: any) => {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
     if (typeof msg.content !== "string") return msg;
     if (msg.content.length <= TOOL_MAX) return msg;
@@ -982,42 +999,65 @@ function sliceLastTurn(
     return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
   });
 
-  // ── 前 N-1 轮：只保留 user 输入 + assistant 文本（去掉 tool schema）──
-  const prevTurnMsgs: any[] = [];
-  let prevOriginalCount = 0;
+  let lastTurnTokens = 0;
+  for (const msg of lastTurnMsgs) lastTurnTokens += estimateMsgTokens(msg);
 
-  if (userIndices.length > 1) {
-    // 从最早的 user 到最后一轮 user 之前
-    const earliestIdx = userIndices[userIndices.length - 1];
-    prevOriginalCount = lastTurnUserIdx - earliestIdx;
+  // ── 更早的轮：按轮分组，只保留 user+assistant 纯文本 ──
+  // turns[0] = 最早轮, turns[last] = 倒数第 2 轮
+  type TurnSlice = { msgs: any[]; tokens: number };
+  const olderTurns: TurnSlice[] = [];
 
-    for (let i = earliestIdx; i < lastTurnUserIdx; i++) {
+  for (let t = userIndices.length - 1; t >= 1; t--) {
+    const startIdx = userIndices[t];
+    const endIdx = userIndices[t - 1]; // next (newer) user turn start
+    const turnMsgs: any[] = [];
+    let turnTokens = 0;
+
+    for (let i = startIdx; i < endIdx; i++) {
       const msg = messages[i];
       if (!msg) continue;
-
       if (msg.role === "user") {
         const text = extractUserText(msg);
         if (text) {
-          prevTurnMsgs.push({ role: "user", content: text });
+          const m = { role: "user", content: text };
+          turnMsgs.push(m);
+          turnTokens += estimateMsgTokens(m);
         }
       } else if (msg.role === "assistant") {
         const text = extractAssistantText(msg);
         if (text) {
-          prevTurnMsgs.push({ role: "assistant", content: text });
+          const m = { role: "assistant", content: text };
+          turnMsgs.push(m);
+          turnTokens += estimateMsgTokens(m);
         }
       }
-      // toolResult / tool_use / thinking 等全部跳过
+      // tool / toolResult / thinking 等跳过
+    }
+    if (turnMsgs.length) olderTurns.push({ msgs: turnMsgs, tokens: turnTokens });
+  }
+
+  // ── 按 token 预算从最早轮开始裁剪 ─────────────────────
+  let totalTokens = lastTurnTokens;
+  for (const t of olderTurns) totalTokens += t.tokens;
+
+  let droppedTurns = 0;
+  if (maxTokens && maxTokens > 0) {
+    // 从最早轮（olderTurns[0]）开始逐轮移除
+    while (olderTurns.length > 0 && totalTokens > maxTokens) {
+      const oldest = olderTurns.shift()!;
+      totalTokens -= oldest.tokens;
+      droppedTurns++;
     }
   }
 
-  // ── 合并：前 N-1 轮摘要 + 最后 1 轮完整 ────────────────
-  const kept = [...prevTurnMsgs, ...lastTurnMsgs];
-  const dropped = messages.length - kept.length;
+  // ── 合并 ─────────────────────────────────────────────
+  const keptMsgs = [
+    ...olderTurns.flatMap((t) => t.msgs),
+    ...lastTurnMsgs,
+  ];
+  const dropped = messages.length - keptMsgs.length;
 
-  let tokens = 0;
-  for (const msg of kept) tokens += estimateMsgTokens(msg);
-
-  return { messages: kept, tokens, dropped };
+  return { messages: keptMsgs, tokens: totalTokens, dropped };
 }
 
 export default graphMemoryPlugin;
