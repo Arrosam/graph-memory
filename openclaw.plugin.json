@@ -8,8 +8,8 @@
     "properties": {
       "dbPath": {
         "type": "string",
-        "default": "~/.openclaw/graph-memory.db",
-        "description": "SQLite 图谱数据库路径"
+        "default": "~/.openclaw/memory/graph-memory.db",
+        "description": "SQLite 图谱数据库路径（per-agent 模式下自动生成 graph-memory-{agentId}.db）"
       },
       "agentId": {
         "type": "string",
