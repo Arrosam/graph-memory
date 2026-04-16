@@ -431,20 +431,11 @@ const graphMemoryPlugin = {
         const totalGmNodes = activeNodes.length + rec.nodes.length;
 
         if (totalGmNodes === 0) {
-          // 即使没有图谱节点，也要按 token 预算裁剪
-          const pct = cfg.compactWindowPercent ?? 0.75;
-          const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
-          const trimmed = sliceLastTurn(messages, maxTok);
+          const trimmed = sliceLastTurn(messages, tokenBudget);
           return { messages: normalizeMessageContent(trimmed.messages), estimatedTokens: trimmed.tokens };
         }
 
-        // ── 1. 按 token 预算裁剪对话轮 ─────────────────
-        const pct = cfg.compactWindowPercent ?? 0.75;
-        const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
-        const lastTurn = sliceLastTurn(messages, maxTok);
-        const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
-
-        // ── 2. 图谱 + 溯源 ─────────────────────────────
+        // ── 1. 图谱 + 溯源（先算，以便从 token 预算中扣除）──
         const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(sdb, {
           tokenBudget: 0,
           activeNodes,
@@ -453,11 +444,17 @@ const graphMemoryPlugin = {
           recalledEdges: rec.edges,
         });
 
+        // ── 2. 按 token 预算裁剪对话轮（扣除图谱占用）────
+        const graphOverhead = gmTokens + episodicTokens;
+        const maxTok = tokenBudget ? Math.max(0, tokenBudget - graphOverhead) : undefined;
+        const lastTurn = sliceLastTurn(messages, maxTok);
+        const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
+
         if (lastTurn.dropped > 0 || episodicTokens > 0) {
           api.logger.info(
             `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
             `dropped ${lastTurn.dropped} older msgs` +
-            (maxTok ? ` (budget ${maxTok} tok, ${Math.round(pct * 100)}% of ${tokenBudget})` : "") +
+            (maxTok != null ? ` (msgBudget ${maxTok} = ${tokenBudget} - graph ${graphOverhead})` : "") +
             `, graph ~${gmTokens} tok` +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
@@ -495,10 +492,9 @@ const graphMemoryPlugin = {
         [k: string]: any;
       }) {
         const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
-        const pct = cfg.compactWindowPercent ?? 0.75;
         const tokBefore = currentTokenCount ?? tokenBudget ?? 0;
-        // Estimate what assemble() will trim to on the next call
-        const tokAfter = tokenBudget ? Math.floor(tokenBudget * pct) : Math.floor(tokBefore * pct);
+        // assemble() will trim messages to fit within tokenBudget (minus graph overhead)
+        const tokAfter = tokenBudget ?? tokBefore;
 
         // 把未提取的消息存入图谱（确保被 assemble 裁剪掉的轮不丢知识）
         const msgs = getUnextracted(sdb, sessionId, 50);
