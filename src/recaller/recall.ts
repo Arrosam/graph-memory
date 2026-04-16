@@ -36,6 +36,9 @@ export class Recaller {
 
   setEmbedFn(fn: EmbedFn): void { this.embed = fn; }
 
+  /** Public accessor for the embed function (avoids breaking encapsulation). */
+  getEmbedFn(): EmbedFn | null { return this.embed; }
+
   async recall(query: string): Promise<RecallResult> {
     const limit = this.cfg.recallMaxNodes;
 

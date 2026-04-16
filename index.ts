@@ -8,115 +8,42 @@
  *   - 去掉 signals 机制，每轮直接提取
  *   - content 模板改为纯文本（无 markdown）
  *   - 提取规则放宽：讨论、分析、对比也会提取
+ *
+ * Architecture (SOLID):
+ *   - SessionManager  — session-agent routing & per-agent DB management   (SRP)
+ *   - extractAndPersist — unified extract→persist pipeline                (SRP, DRY)
+ *   - message-processor — prompt cleaning, normalization, slicing         (SRP)
+ *   - register-tools   — tool definitions, decoupled from plugin wiring  (SRP, OCP)
+ *   - Recaller.getEmbedFn() — replaces (recaller as any).embed           (DIP)
+ *   - This file         — thin orchestration layer only
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { Type } from "@sinclair/typebox";
-import { getDb, resolveAgentDbPath } from "./src/store/db.ts";
-import {
-  saveMessage, getUnextracted,
-  markExtracted,
-  upsertNode, upsertEdge, findByName,
-  getBySession, edgesFrom, edgesTo,
-  deprecate, getStats,
-} from "./src/store/store.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
-import { Recaller } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
+import { extractAndPersist } from "./src/extractor/pipeline.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
-import { DEFAULT_CONFIG, type GmConfig, normalizeNodeType } from "./src/types.ts";
+import {
+  saveMessage, getUnextracted,
+  upsertNode, upsertEdge, findByName,
+  getBySession, edgesFrom, edgesTo,
+  deprecate,
+} from "./src/store/store.ts";
+import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
+import { SessionManager } from "./src/session/session-manager.ts";
+import { registerTools } from "./src/tools/register-tools.ts";
+import {
+  readProviderModel,
+  cleanPrompt,
+  normalizeMessageContent,
+  sliceLastTurn,
+} from "./src/message/message-processor.ts";
 
-// ─── 从 OpenClaw config 读 provider/model ────────────────────
-
-function readProviderModel(apiConfig: unknown): { provider: string; model: string } {
-  let raw = "";
-
-  if (apiConfig && typeof apiConfig === "object") {
-    const m = (apiConfig as any).agents?.defaults?.model;
-    if (typeof m === "string" && m.trim()) {
-      raw = m.trim();
-    } else if (m && typeof m === "object" && typeof m.primary === "string" && m.primary.trim()) {
-      raw = m.primary.trim();
-    }
-  }
-
-  if (!raw) {
-    raw = (process.env.OPENCLAW_PROVIDER ?? "anthropic") + "/claude-haiku-4-5-20251001";
-  }
-
-  if (raw.includes("/")) {
-    const [provider, ...rest] = raw.split("/");
-    const model = rest.join("/").trim();
-    if (provider?.trim() && model) {
-      return { provider: provider.trim(), model };
-    }
-  }
-
-  const provider = (process.env.OPENCLAW_PROVIDER ?? "anthropic").trim();
-  return { provider, model: raw };
-}
-
-// ─── 清洗 OpenClaw metadata 包装 ─────────────────────────────
-
-function cleanPrompt(raw: string): string {
-  let prompt = raw.trim();
-
-  if (prompt.includes("Sender (untrusted metadata)")) {
-    const jsonStart = prompt.indexOf("```json");
-    if (jsonStart >= 0) {
-      const jsonEnd = prompt.indexOf("```", jsonStart + 7);
-      if (jsonEnd >= 0) {
-        prompt = prompt.slice(jsonEnd + 3).trim();
-      }
-    }
-    if (prompt.includes("Sender (untrusted metadata)")) {
-      const lines = prompt.split("\n").filter(l => l.trim() && !l.includes("Sender") && !l.startsWith("```") && !l.startsWith("{"));
-      prompt = lines.join("\n").trim();
-    }
-  }
-
-  prompt = prompt.replace(/^\/\w+\s+/, "").trim();
-  prompt = prompt.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
-
-  return prompt;
-}
-
-// ─── 规范化消息 content，确保 OpenClaw 对 content.filter() 不崩 ──
-
-function normalizeMessageContent(messages: any[]): any[] {
-  return messages.map((msg: any) => {
-    if (!msg || typeof msg !== "object") return msg;
-    const c = msg.content;
-    // 已经是数组 → 修复畸形 block（如 { type: "text" } 缺 text 属性）
-    if (Array.isArray(c)) {
-      let changed = false;
-      const fixed = c.map((block: any) => {
-        if (block && typeof block === "object" && block.type === "text" && !("text" in block)) {
-          changed = true;
-          return { ...block, text: "" };
-        }
-        return block;
-      });
-      if (changed) return { ...msg, content: fixed };
-      return msg;
-    }
-    // string → 包装成标准 content block 数组
-    if (typeof c === "string") {
-      return { ...msg, content: [{ type: "text", text: c }] };
-    }
-    // undefined/null → 空 text block
-    if (c == null) {
-      return { ...msg, content: [{ type: "text", text: "" }] };
-    }
-    return msg;
-  });
-}
-
-// ─── 插件对象 ─────────────────────────────────────────────────
+// ─── Plugin Object ───────────────────────────────────────────
 
 const graphMemoryPlugin = {
   id: "graph-memory",
@@ -125,7 +52,7 @@ const graphMemoryPlugin = {
     "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
 
   register(api: OpenClawPluginApi) {
-    // ── 读配置 ──────────────────────────────────────────────
+    // ── Config ────────────────────────────────────────────
     const raw =
       api.pluginConfig && typeof api.pluginConfig === "object"
         ? (api.pluginConfig as any)
@@ -133,75 +60,16 @@ const graphMemoryPlugin = {
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     const { provider, model } = readProviderModel(api.config);
 
-    // ── 初始化核心模块 ──────────────────────────────────────
+    // ── Core dependencies ─────────────────────────────────
     const llm = createCompleteFn(provider, model, cfg.llm);
     const extractor = new Extractor(cfg, llm);
+    const sessions = new SessionManager(cfg, api.logger);
 
-    // ── Per-agent DB routing ────────────────────────────────
-    // OpenClaw calls register() once; runtime hooks provide ctx.agentId per session.
-    // All DB+Recaller instances are created lazily on first use, keyed by agentId.
-    // This avoids opening the unified DB when per-agent DBs are in use.
-    let sharedEmbedFn: ((text: string) => Promise<number[]>) | null = null;
-    const sessionAgentMap = new Map<string, string>();
-    const agentCache = new Map<string, { db: ReturnType<typeof getDb>; recaller: Recaller }>();
-
-    /** Try to extract agentId from an OpenClaw sessionKey.
-     *  Known patterns: "agent:<id>:…", "<channel>:<account>:agent:<id>:…" */
-    function parseAgentIdFromKey(sessionKey?: string): string | undefined {
-      if (!sessionKey) return undefined;
-      const m = sessionKey.match(/(?:^|:)agent:([^:]+)/);
-      return m?.[1]?.trim() || undefined;
-    }
-
-    function bindSession(ctx: any): void {
-      const aid = ctx?.agentId?.trim();
-      if (!aid) return;
-      if (ctx.sessionId) sessionAgentMap.set(ctx.sessionId, aid);
-      if (ctx.sessionKey && ctx.sessionKey !== ctx.sessionId) {
-        sessionAgentMap.set(ctx.sessionKey, aid);
-      }
-    }
-
-    /** Resolve agentId from: explicit param → sessionAgentMap → sessionKey pattern → config fallback */
-    function resolveAgentId(sessionId?: string, sessionKey?: string, explicitAgentId?: string): string | undefined {
-      return explicitAgentId?.trim()
-        || (sessionKey ? sessionAgentMap.get(sessionKey) : undefined)
-        || (sessionId ? sessionAgentMap.get(sessionId) : undefined)
-        || parseAgentIdFromKey(sessionKey)
-        || undefined;
-    }
-
-    function getAgentResources(agentId?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
-      // Resolve effective agentId: runtime agentId → config agentId → empty (unified)
-      const aid = agentId?.trim() || cfg.agentId?.trim() || "";
-      let cached = agentCache.get(aid);
-      if (cached) return cached;
-      const path = resolveAgentDbPath(cfg.dbPath, aid || undefined);
-      const agentDb = getDb(path);
-      const agentRecaller = new Recaller(agentDb, cfg);
-      if (sharedEmbedFn) agentRecaller.setEmbedFn(sharedEmbedFn);
-      cached = { db: agentDb, recaller: agentRecaller };
-      agentCache.set(aid, cached);
-      api.logger.info(`[graph-memory] initialized DB: ${path}` + (aid ? ` (agent=${aid})` : " (shared)"));
-      return cached;
-    }
-
-    function getSessionResources(sessionId: string, sessionKey?: string, agentId?: string): { db: ReturnType<typeof getDb>; recaller: Recaller } {
-      const resolved = resolveAgentId(sessionId, sessionKey, agentId);
-      // If we discovered agentId late (e.g. from sessionKey pattern), cache the mapping
-      if (resolved && !sessionAgentMap.has(sessionId)) {
-        sessionAgentMap.set(sessionId, resolved);
-        if (sessionKey && sessionKey !== sessionId) sessionAgentMap.set(sessionKey, resolved);
-      }
-      return getAgentResources(resolved);
-    }
-
-    // ── 初始化 embedding ────────────────────────────────────
+    // ── Initialize embedding (async, non-blocking) ────────
     createEmbedFn(cfg, (m) => api.logger.info(m))
       .then((fn) => {
         if (fn) {
-          sharedEmbedFn = fn;
-          for (const res of agentCache.values()) res.recaller.setEmbedFn(fn);
+          sessions.setEmbedFn(fn);
           api.logger.info("[graph-memory] vector search ready");
         } else {
           api.logger.info(
@@ -213,108 +81,74 @@ const graphMemoryPlugin = {
         api.logger.info("[graph-memory] FTS5 search mode");
       });
 
-    // ── Session 运行时状态 ──────────────────────────────────
+    // ── Session runtime state ─────────────────────────────
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
-    const turnCounter = new Map<string, number>(); // 社区维护计数器
-
-    // ── 提取串行化（同 session Promise chain，不同 session 并行）────
+    const turnCounter = new Map<string, number>();
     const extractChain = new Map<string, Promise<void>>();
 
-    /** 存一条消息到 gm_messages（同步，零 LLM） */
+    // ── Helpers ───────────────────────────────────────────
+
     function ingestMessage(sessionId: string, message: any, sessionKey?: string, agentId?: string): void {
-      const { db: sdb } = getSessionResources(sessionId, sessionKey, agentId);
+      const { db } = sessions.getSessionResources(sessionId, sessionKey, agentId);
       let seq = msgSeq.get(sessionId);
       if (seq === undefined) {
-        // 首次入库：从数据库读取当前最大 turn_index，避免重启后 turn_index 重叠
-        const row = sdb.prepare(
-          "SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=?"
+        const row = db.prepare(
+          "SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=?",
         ).get(sessionId) as any;
         seq = Number(row?.maxTurn) || 0;
       }
       seq += 1;
       msgSeq.set(sessionId, seq);
-      saveMessage(sdb, sessionId, seq, message.role ?? "unknown", message);
+      saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
     }
 
-    /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
-    async function runTurnExtract(sessionId: string, newMessages: any[], sessionKey?: string, agentId?: string): Promise<void> {
+    async function runTurnExtract(
+      sessionId: string, newMessages: any[], sessionKey?: string, agentId?: string,
+    ): Promise<void> {
       if (!newMessages.length) return;
 
-      // Promise chain：上一次提取完了才跑下一次，不会跳过
       const prev = extractChain.get(sessionId) ?? Promise.resolve();
       const next = prev.then(async () => {
         try {
-          const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
-          const msgs = getUnextracted(sdb, sessionId, 50);
+          const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
+          const msgs = getUnextracted(db, sessionId, 50);
           if (!msgs.length) return;
 
-          const existing = getBySession(sdb, sessionId).map((n) => n.name);
-          const result = await extractor.extract({
-            messages: msgs,
-            existingNames: existing,
-          });
+          const result = await extractAndPersist(db, recaller, extractor, sessionId, msgs);
 
-          const nameToId = new Map<string, string>();
-          for (const nc of result.nodes) {
-            const { node } = upsertNode(sdb, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            sRecaller.syncEmbed(node).catch(() => {});
-          }
-
-          for (const ec of result.edges) {
-            const fromId = nameToId.get(ec.from) ?? findByName(sdb, ec.from)?.id;
-            const toId = nameToId.get(ec.to) ?? findByName(sdb, ec.to)?.id;
-            if (fromId && toId) {
-              upsertEdge(sdb, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
-              });
-            }
-          }
-
-          const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-          markExtracted(sdb, sessionId, maxTurn);
-
-          if (result.nodes.length || result.edges.length) {
-            invalidateGraphCache(sdb);
-            const nodeDetails = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
-            const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.type}]→${e.to}`).join(", ");
+          if (result.nodesExtracted || result.edgesExtracted) {
             api.logger.info(
-              `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]`,
+              `[graph-memory] extracted ${result.nodesExtracted} nodes [${result.nodeDetails}], ${result.edgesExtracted} edges [${result.edgeDetails}]`,
             );
           }
         } catch (err) {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
-          // 不 throw — 失败不阻塞 chain 中下一次提取
         }
       });
       extractChain.set(sessionId, next);
       return next;
     }
 
-    // ── session_start：bind agent identity ────────────────────
+    // ── session_start ─────────────────────────────────────
 
     api.on("session_start", async (_event: any, ctx: any) => {
       api.logger.info(
         `[graph-memory] session_start ctx keys=[${ctx ? Object.keys(ctx).join(",") : "null"}] agentId=${ctx?.agentId ?? "∅"} sessionId=${(ctx?.sessionId ?? "∅").slice(0, 8)} sessionKey=${(ctx?.sessionKey ?? "∅").slice(0, 20)}`,
       );
-      bindSession(ctx);
+      sessions.bindSession(ctx);
     });
 
-    // ── before_prompt_build：召回 ────────────────────────────
+    // ── before_prompt_build: recall ───────────────────────
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {
       try {
-        if (!sessionAgentMap.has(ctx?.sessionId)) {
+        if (!sessions.hasSession(ctx?.sessionId)) {
           api.logger.info(
             `[graph-memory] before_prompt_build ctx keys=[${ctx ? Object.keys(ctx).join(",") : "null"}] agentId=${ctx?.agentId ?? "∅"} sessionId=${(ctx?.sessionId ?? "∅").slice(0, 8)}`,
           );
         }
-        bindSession(ctx);
+        sessions.bindSession(ctx);
 
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
         const prompt = cleanPrompt(rawPrompt);
@@ -323,8 +157,8 @@ const graphMemoryPlugin = {
 
         api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
-        const { recaller: agentRecaller } = getAgentResources(ctx?.agentId);
-        const res = await agentRecaller.recall(prompt);
+        const { recaller } = sessions.getAgentResources(ctx?.agentId);
+        const res = await recaller.recall(prompt);
         if (res.nodes.length) {
           if (ctx?.sessionId) recalled.set(ctx.sessionId, res);
           if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
@@ -339,43 +173,30 @@ const graphMemoryPlugin = {
       }
     });
 
-    // ── ContextEngine ────────────────────────────────────────
+    // ── ContextEngine ─────────────────────────────────────
 
     const engine = {
       info: {
         id: "graph-memory",
         name: "Graph Memory",
-        ownsCompaction: true,  // we handle compaction: extract oldest turn → remove from context
+        ownsCompaction: true,
       },
 
-      async bootstrap({ sessionId, sessionKey, agentId, ...rest }: { sessionId: string; sessionKey?: string; agentId?: string; [k: string]: any }) {
-        // Eagerly bind if OpenClaw passes agentId in bootstrap
+      async bootstrap({ sessionId, sessionKey, agentId }: { sessionId: string; sessionKey?: string; agentId?: string; [k: string]: any }) {
         if (agentId) {
           const aid = agentId.trim();
-          if (aid && sessionId) sessionAgentMap.set(sessionId, aid);
-          if (aid && sessionKey && sessionKey !== sessionId) sessionAgentMap.set(sessionKey, aid);
+          if (aid && sessionId) sessions.bindSession({ agentId: aid, sessionId, sessionKey });
         }
         return { bootstrapped: true };
       },
 
       async ingest({
-        sessionId,
-        sessionKey,
-        message,
-        isHeartbeat,
-        agentId,
-        ...rest
+        sessionId, sessionKey, message, isHeartbeat, agentId, ...rest
       }: {
-        sessionId: string;
-        sessionKey?: string;
-        message: any;
-        isHeartbeat?: boolean;
-        agentId?: string;
-        [k: string]: any;
+        sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean; agentId?: string; [k: string]: any;
       }) {
         if (isHeartbeat) return { ingested: false };
-        // Log once per session to diagnose agentId availability in ContextEngine methods
-        if (!sessionAgentMap.has(sessionId)) {
+        if (!sessions.hasSession(sessionId)) {
           const extraKeys = Object.keys(rest).join(",");
           api.logger.info(
             `[graph-memory] ingest first-seen sid=${sessionId.slice(0, 8)} agentId=${agentId ?? "∅"} sessionKey=${(sessionKey ?? "∅").slice(0, 30)} extraKeys=[${extraKeys}]`,
@@ -386,66 +207,46 @@ const graphMemoryPlugin = {
       },
 
       async assemble({
-        sessionId,
-        sessionKey,
-        messages,
-        tokenBudget,
-        prompt,
-        agentId,
-        ...rest
+        sessionId, sessionKey, messages, tokenBudget, prompt, agentId,
       }: {
-        sessionId: string;
-        sessionKey?: string;
-        messages: any[];
-        tokenBudget?: number;
-        prompt?: string;  // Added in OpenClaw 2026.03.28: prompt-aware retrieval
-        agentId?: string;
-        [k: string]: any;
+        sessionId: string; sessionKey?: string; messages: any[]; tokenBudget?: number; prompt?: string; agentId?: string; [k: string]: any;
       }) {
-        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
-        const activeNodes = getBySession(sdb, sessionId);
+        const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
+        const activeNodes = getBySession(db, sessionId);
         const activeEdges = activeNodes.flatMap((n) => [
-          ...edgesFrom(sdb, n.id),
-          ...edgesTo(sdb, n.id),
+          ...edgesFrom(db, n.id),
+          ...edgesTo(db, n.id),
         ]);
 
-        // OpenClaw 2026.03.28: use the prompt for a fresh, accurate recall
-        // at assembly time instead of relying solely on the pre-cached result
-        // from before_agent_start.
         let rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
         if (prompt) {
           const cleaned = cleanPrompt(prompt);
           if (cleaned) {
             try {
-              const freshRec = await sRecaller.recall(cleaned);
+              const freshRec = await recaller.recall(cleaned);
               if (freshRec.nodes.length) {
                 rec = freshRec;
                 recalled.set(sessionId, freshRec);
               }
             } catch (err) {
               api.logger.warn(`[graph-memory] assemble recall failed: ${err}`);
-              // fall through to cached rec
             }
           }
         }
+
         const totalGmNodes = activeNodes.length + rec.nodes.length;
+        const pct = cfg.compactWindowPercent ?? 0.75;
+        const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
 
         if (totalGmNodes === 0) {
-          // 即使没有图谱节点，也要按 token 预算裁剪
-          const pct = cfg.compactWindowPercent ?? 0.75;
-          const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
           const trimmed = sliceLastTurn(messages, maxTok);
           return { messages: normalizeMessageContent(trimmed.messages), estimatedTokens: trimmed.tokens };
         }
 
-        // ── 1. 按 token 预算裁剪对话轮 ─────────────────
-        const pct = cfg.compactWindowPercent ?? 0.75;
-        const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
         const lastTurn = sliceLastTurn(messages, maxTok);
         const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
-        // ── 2. 图谱 + 溯源 ─────────────────────────────
-        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(sdb, {
+        const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, {
           tokenBudget: 0,
           activeNodes,
           activeEdges,
@@ -463,7 +264,6 @@ const graphMemoryPlugin = {
           );
         }
 
-        // ── 3. 组装 systemPrompt ────────────────────────
         let systemPromptAddition: string | undefined;
         const parts = [systemPrompt, xml, episodicXml].filter(Boolean);
         if (parts.length) {
@@ -478,68 +278,26 @@ const graphMemoryPlugin = {
       },
 
       async compact({
-        sessionId,
-        sessionKey,
-        currentTokenCount,
-        agentId,
-        ...rest
+        sessionId, sessionKey, currentTokenCount, agentId,
       }: {
-        sessionId: string;
-        sessionKey?: string;
-        sessionFile: string;
-        tokenBudget?: number;
-        force?: boolean;
-        currentTokenCount?: number;
-        agentId?: string;
-        [k: string]: any;
+        sessionId: string; sessionKey?: string; sessionFile: string; tokenBudget?: number;
+        force?: boolean; currentTokenCount?: number; agentId?: string; [k: string]: any;
       }) {
-        const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
-
-        // 把未提取的消息存入图谱（确保被 assemble 裁剪掉的轮不丢知识）
-        const msgs = getUnextracted(sdb, sessionId, 50);
+        const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
+        const msgs = getUnextracted(db, sessionId, 50);
         if (!msgs.length) {
           return { ok: true, compacted: true, result: { summary: "no unextracted messages", tokensBefore: currentTokenCount ?? 0 } };
         }
 
         try {
-          const existing = getBySession(sdb, sessionId).map((n) => n.name);
-          const result = await extractor.extract({
-            messages: msgs,
-            existingNames: existing,
-          });
-
-          const nameToId = new Map<string, string>();
-          for (const nc of result.nodes) {
-            const { node } = upsertNode(sdb, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            sRecaller.syncEmbed(node).catch(() => {});
-          }
-
-          for (const ec of result.edges) {
-            const fromId = nameToId.get(ec.from) ?? findByName(sdb, ec.from)?.id;
-            const toId = nameToId.get(ec.to) ?? findByName(sdb, ec.to)?.id;
-            if (fromId && toId) {
-              upsertEdge(sdb, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
-              });
-            }
-          }
-
-          const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-          markExtracted(sdb, sessionId, maxTurn);
-
+          const result = await extractAndPersist(db, recaller, extractor, sessionId, msgs);
           api.logger.info(
-            `[graph-memory] compact: extracted ${result.nodes.length} nodes, ${result.edges.length} edges (assemble handles context trimming)`,
+            `[graph-memory] compact: extracted ${result.nodesExtracted} nodes, ${result.edgesExtracted} edges (assemble handles context trimming)`,
           );
-
           return {
             ok: true, compacted: true,
             result: {
-              summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
+              summary: `extracted ${result.nodesExtracted} nodes, ${result.edgesExtracted} edges`,
               tokensBefore: currentTokenCount ?? 0,
             },
           };
@@ -550,65 +308,46 @@ const graphMemoryPlugin = {
       },
 
       async afterTurn({
-        sessionId,
-        sessionKey,
-        messages,
-        prePromptMessageCount,
-        isHeartbeat,
-        agentId,
-        ...rest
+        sessionId, sessionKey, messages, prePromptMessageCount, isHeartbeat, agentId,
       }: {
-        sessionId: string;
-        sessionKey?: string;
-        sessionFile: string;
-        messages: any[];
-        prePromptMessageCount: number;
-        autoCompactionSummary?: string;
-        isHeartbeat?: boolean;
-        tokenBudget?: number;
-        agentId?: string;
-        [k: string]: any;
+        sessionId: string; sessionKey?: string; sessionFile: string; messages: any[];
+        prePromptMessageCount: number; autoCompactionSummary?: string; isHeartbeat?: boolean;
+        tokenBudget?: number; agentId?: string; [k: string]: any;
       }) {
         if (isHeartbeat) return;
 
-        // Messages are already persisted by ingest() — only slice to
-        // determine the new-message count for extraction triggering.
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
-
         const totalMsgs = msgSeq.get(sessionId) ?? 0;
         api.logger.info(
           `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
         );
 
-        // ★ 每轮直接提取
         runTurnExtract(sessionId, newMessages, sessionKey, agentId).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
 
-        // ★ 社区维护：每 N 轮触发一次（纯计算，<5ms）
         const turns = (turnCounter.get(sessionId) ?? 0) + 1;
         turnCounter.set(sessionId, turns);
         const maintainInterval = cfg.compactTurnCount ?? 7;
 
         if (turns % maintainInterval === 0) {
           try {
-            const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
-            invalidateGraphCache(sdb);
-            const pr = computeGlobalPageRank(sdb, cfg);
-            const comm = detectCommunities(sdb);
+            const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
+            invalidateGraphCache(db);
+            const pr = computeGlobalPageRank(db, cfg);
+            const comm = detectCommunities(db);
             api.logger.info(
               `[graph-memory] periodic maintenance (turn ${turns}): ` +
               `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}, ` +
               `communities=${comm.count}`,
             );
 
-            // 社区摘要：fire-and-forget（后台异步，不阻塞 afterTurn 返回）
             if (comm.communities.size > 0) {
               (async () => {
                 try {
                   const { summarizeCommunities } = await import("./src/graph/community.ts");
-                  const embedFn = (sRecaller as any).embed ?? undefined;
-                  const summaries = await summarizeCommunities(sdb, comm.communities, llm, embedFn);
+                  const embedFn = recaller.getEmbedFn() ?? undefined;
+                  const summaries = await summarizeCommunities(db, comm.communities, llm, embedFn);
                   api.logger.info(
                     `[graph-memory] community summaries refreshed: ${summaries} summaries`,
                   );
@@ -624,27 +363,25 @@ const graphMemoryPlugin = {
       },
 
       async prepareSubagentSpawn({
-        parentSessionKey,
-        childSessionKey,
+        parentSessionKey, childSessionKey,
       }: {
-        parentSessionKey: string;
-        childSessionKey: string;
+        parentSessionKey: string; childSessionKey: string;
       }) {
         const rec = recalled.get(parentSessionKey);
         if (rec) recalled.set(childSessionKey, rec);
-        // Propagate agent binding to child session
-        const parentAgent = sessionAgentMap.get(parentSessionKey);
-        if (parentAgent) sessionAgentMap.set(childSessionKey, parentAgent);
-        return { rollback: () => {
-          recalled.delete(childSessionKey);
-          sessionAgentMap.delete(childSessionKey);
-        } };
+        sessions.propagateSession(parentSessionKey, childSessionKey);
+        return {
+          rollback: () => {
+            recalled.delete(childSessionKey);
+            sessions.cleanupSession(childSessionKey);
+          },
+        };
       },
 
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
         recalled.delete(childSessionKey);
         msgSeq.delete(childSessionKey);
-        sessionAgentMap.delete(childSessionKey);
+        sessions.cleanupSession(childSessionKey);
       },
 
       async dispose() {
@@ -652,64 +389,57 @@ const graphMemoryPlugin = {
         msgSeq.clear();
         recalled.clear();
         turnCounter.clear();
-        sessionAgentMap.clear();
-        agentCache.clear();
+        sessions.dispose();
       },
     };
 
     api.registerContextEngine("graph-memory", () => engine);
 
-    // ── session_end：finalize + 图维护 ──────────────────────
+    // ── session_end: finalize + maintenance ────────────────
 
     api.on("session_end", async (event: any, ctx: any) => {
-      bindSession(ctx);
+      sessions.bindSession(ctx);
       const sid =
-        ctx?.sessionKey ??
-        ctx?.sessionId ??
-        event?.sessionKey ??
-        event?.sessionId;
+        ctx?.sessionKey ?? ctx?.sessionId ?? event?.sessionKey ?? event?.sessionId;
       if (!sid) return;
 
       try {
-        const { db: sdb, recaller: sRecaller } = getAgentResources(ctx?.agentId);
-        const nodes = getBySession(sdb, sid);
+        const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
+        const nodes = getBySession(db, sid);
         if (nodes.length) {
           const summary = (
-            sdb.prepare(
+            db.prepare(
               "SELECT name, type, validated_count, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 20",
             ).all() as any[]
           )
             .map((n) => `${n.type}:${n.name}(v${n.validated_count},pr${n.pagerank.toFixed(3)})`)
             .join(", ");
 
-          const fin = await extractor.finalize({
-            sessionNodes: nodes,
-            graphSummary: summary,
-          });
+          const fin = await extractor.finalize({ sessionNodes: nodes, graphSummary: summary });
 
           for (const nc of fin.promotedSkills) {
             if (nc.name && nc.content) {
-              upsertNode(sdb, {
+              upsertNode(db, {
                 type: "SKILL", name: nc.name,
                 description: nc.description ?? "", content: nc.content,
               }, sid);
             }
           }
           for (const ec of fin.newEdges) {
-            const fromId = findByName(sdb, ec.from)?.id;
-            const toId = findByName(sdb, ec.to)?.id;
+            const fromId = findByName(db, ec.from)?.id;
+            const toId = findByName(db, ec.to)?.id;
             if (fromId && toId) {
-              upsertEdge(sdb, {
+              upsertEdge(db, {
                 fromId, toId, type: ec.type,
                 instruction: ec.instruction, sessionId: sid,
               });
             }
           }
-          for (const id of fin.invalidations) deprecate(sdb, id);
+          for (const id of fin.invalidations) deprecate(db, id);
         }
 
-        const embedFn = (sRecaller as any).embed ?? undefined;
-        const result = await runMaintenance(sdb, cfg, llm, embedFn);
+        const embedFn = recaller.getEmbedFn() ?? undefined;
+        const result = await runMaintenance(db, cfg, llm, embedFn);
         api.logger.info(
           `[graph-memory] maintenance: ${result.durationMs}ms, ` +
           `dedup=${result.dedup.merged}, ` +
@@ -724,173 +454,13 @@ const graphMemoryPlugin = {
         msgSeq.delete(sid);
         recalled.delete(sid);
         turnCounter.delete(sid);
-        if (ctx?.sessionId) sessionAgentMap.delete(ctx.sessionId);
-        if (ctx?.sessionKey) sessionAgentMap.delete(ctx.sessionKey);
+        sessions.cleanupSession(ctx?.sessionId, ctx?.sessionKey);
       }
     });
 
-    // ── Agent Tools（改名 gm_*）──────────────────────────────
+    // ── Register agent tools ──────────────────────────────
 
-    api.registerTool(
-      (ctx: any) => ({
-        name: "gm_search",
-        label: "Search Graph Memory",
-        description: "搜索知识图谱中的相关经验、技能和解决方案。遇到可能之前解决过的问题时调用。",
-        parameters: Type.Object({
-          query: Type.String({ description: "搜索关键词或问题描述" }),
-        }),
-        async execute(_toolCallId: string, params: { query: string }) {
-          const { query } = params;
-          const { recaller: tRecaller } = getAgentResources(ctx?.agentId);
-          const res = await tRecaller.recall(query);
-          if (!res.nodes.length) {
-            return {
-              content: [{ type: "text", text: "图谱中未找到相关记录。" }],
-              details: { count: 0, query },
-            };
-          }
-
-          const lines = res.nodes.map(
-            (n) => `[${n.type}] ${n.name} (pr:${n.pagerank.toFixed(3)})\n${n.description}\n${n.content.slice(0, 400)}`,
-          );
-          const edgeLines = res.edges.map((e) => {
-            const from = res.nodes.find((n) => n.id === e.fromId)?.name ?? e.fromId;
-            const to = res.nodes.find((n) => n.id === e.toId)?.name ?? e.toId;
-            return `  ${from} --[${e.type}]--> ${to}: ${e.instruction}`;
-          });
-
-          const text = [
-            `找到 ${res.nodes.length} 个节点：\n`,
-            ...lines,
-            ...(edgeLines.length ? ["\n关系：", ...edgeLines] : []),
-          ].join("\n\n");
-
-          return {
-            content: [{ type: "text", text }],
-            details: { count: res.nodes.length, query },
-          };
-        },
-      }),
-      { name: "gm_search" },
-    );
-
-    api.registerTool(
-      (ctx: any) => ({
-        name: "gm_record",
-        label: "Record to Graph Memory",
-        description: "手动记录经验到知识图谱。发现重要解法、踩坑经验或工作流程时调用。",
-        parameters: Type.Object({
-          name: Type.String({ description: "节点名称（全小写连字符）" }),
-          type: Type.String({ description: "实体类型：TASK、SKILL 或 EVENT" }),
-          description: Type.String({ description: "一句话说明" }),
-          content: Type.String({ description: "纯文本格式的知识内容" }),
-          relatedSkill: Type.Optional(
-            Type.String({ description: "可选：关联的已有技能名（建立 SOLVED_BY 关系）" }),
-          ),
-        }),
-        async execute(
-          _toolCallId: string,
-          p: { name: string; type: string; description: string; content: string; relatedSkill?: string },
-        ) {
-          const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
-          const { db: tdb, recaller: tRecaller } = getAgentResources(ctx?.agentId);
-          const nodeType = normalizeNodeType(p.type);
-          if (!nodeType) {
-            return {
-              content: [{
-                type: "text",
-                text: `类型无效：${p.type}。只允许 TASK、SKILL、EVENT。`,
-              }],
-              details: { error: "invalid_type", type: p.type },
-            };
-          }
-          const { node } = upsertNode(tdb, {
-            type: nodeType, name: p.name,
-            description: p.description, content: p.content,
-          }, sid);
-          if (p.relatedSkill) {
-            const rel = findByName(tdb, p.relatedSkill);
-            if (rel) {
-              upsertEdge(tdb, {
-                fromId: node.id, toId: rel.id, type: "SOLVED_BY",
-                instruction: `关联 ${p.relatedSkill}`, sessionId: sid,
-              });
-            }
-          }
-          tRecaller.syncEmbed(node).catch(() => {});
-          return {
-            content: [{ type: "text", text: `已记录：${node.name} (${node.type})` }],
-            details: { name: node.name, type: node.type },
-          };
-        },
-      }),
-      { name: "gm_record" },
-    );
-
-    api.registerTool(
-      (ctx: any) => ({
-        name: "gm_stats",
-        label: "Graph Memory Stats",
-        description: "查看知识图谱的统计信息：节点数、边数、社区数、PageRank Top 节点。",
-        parameters: Type.Object({}),
-        async execute(_toolCallId: string, _params: any) {
-          const { db: tdb } = getAgentResources(ctx?.agentId);
-          const stats = getStats(tdb);
-          const topPr = (tdb.prepare(
-            "SELECT name, type, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 5"
-          ).all() as any[]);
-
-          const text = [
-            `知识图谱统计`,
-            `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
-            `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
-            `社区：${stats.communities} 个`,
-            `PageRank Top 5：`,
-            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
-          ].join("\n");
-          return {
-            content: [{ type: "text", text }],
-            details: stats,
-          };
-        },
-      }),
-      { name: "gm_stats" },
-    );
-
-    api.registerTool(
-      (ctx: any) => ({
-        name: "gm_maintain",
-        label: "Graph Memory Maintenance",
-        description: "手动触发图维护：运行去重、PageRank 重算、社区检测。通常 session_end 时自动运行，这个工具用于手动触发。",
-        parameters: Type.Object({}),
-        async execute(_toolCallId: string, _params: any) {
-          const { db: tdb, recaller: tRecaller } = getAgentResources(ctx?.agentId);
-          const embedFn = (tRecaller as any).embed ?? undefined;
-          const result = await runMaintenance(tdb, cfg, llm, embedFn);
-          const text = [
-            `图维护完成（${result.durationMs}ms）`,
-            `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
-            ...(result.dedup.pairs.length > 0
-              ? result.dedup.pairs.slice(0, 5).map(p =>
-                  `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)
-              : []),
-            `社区：${result.community.count} 个`,
-            `PageRank Top 5：`,
-            ...result.pagerank.topK.slice(0, 5).map((n, i) =>
-              `  ${i + 1}. ${n.name} (${n.score.toFixed(4)})`),
-          ].join("\n");
-          return {
-            content: [{ type: "text", text }],
-            details: {
-              durationMs: result.durationMs,
-              dedupMerged: result.dedup.merged,
-              communities: result.community.count,
-            },
-          };
-        },
-      }),
-      { name: "gm_maintain" },
-    );
+    registerTools(api, sessions, cfg, llm);
 
     api.logger.info(
       `[graph-memory] ready | dbBase=${cfg.dbPath} (per-agent: <base>-{agentId}.db)` +
@@ -898,166 +468,5 @@ const graphMemoryPlugin = {
     );
   },
 };
-
-// ─── 取最近 N 轮用户交互（保留多步任务上下文） ──────────────
-
-function estimateMsgTokens(msg: any): number {
-  const text = typeof msg.content === "string"
-    ? msg.content
-    : JSON.stringify(msg.content ?? "");
-  return Math.ceil(text.length / 3);
-}
-
-const MIN_KEEP_TURNS = 1;   // 至少保留最新 1 轮
-const MAX_KEEP_TURNS = 10;  // 最多保留 10 轮
-
-/**
- * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
- */
-function extractAssistantText(msg: any): string {
-  if (typeof msg.content === "string") return msg.content;
-  if (!Array.isArray(msg.content)) return "";
-  return msg.content
-    .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
-    .map((b: any) => b.text)
-    .join("\n")
-    .trim();
-}
-
-/**
- * 提取 user 消息的纯文本内容
- * 去掉 OpenClaw 包装的 metadata（Sender JSON block、命令前缀、时间戳等）
- */
-function extractUserText(msg: any): string {
-  let raw: string;
-  if (typeof msg.content === "string") {
-    raw = msg.content;
-  } else if (!Array.isArray(msg.content)) {
-    raw = String(msg.content ?? "");
-  } else {
-    raw = msg.content
-      .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
-      .map((b: any) => b.text)
-      .join("\n")
-      .trim();
-  }
-
-  // 去掉 OpenClaw metadata: "Sender (untrusted metadata):\n```json\n{...}\n```\n实际内容"
-  // 策略：找最后一个 ``` 闭合后的内容，如果没有 ``` 就用 cleanPrompt 兜底
-  const fenceEnd = raw.lastIndexOf("```");
-  if (fenceEnd >= 0 && raw.includes("Sender")) {
-    raw = raw.slice(fenceEnd + 3).trim();
-  }
-
-  // 兜底：去掉命令前缀、时间戳标记等
-  raw = raw.replace(/^\/\w+\s+/, "").trim();
-  raw = raw.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
-
-  return raw;
-}
-
-/**
- * 按 token 预算动态保留最近 N 轮对话。
- *
- * - 最新 1 轮：完整保留（含 tool_result，截断超长的）
- * - 更早的轮：只保留 user + assistant 纯文本（去掉 tool schema / thinking）
- * - 从最早轮开始逐轮裁剪，直到 token 预算内或只剩 1 轮
- *
- * @param maxTokens 0 或 undefined 表示不限制，使用 MAX_KEEP_TURNS 兜底
- */
-function sliceLastTurn(
-  messages: any[],
-  maxTokens?: number,
-): { messages: any[]; tokens: number; dropped: number } {
-  if (!messages.length) {
-    return { messages: [], tokens: 0, dropped: 0 };
-  }
-
-  // ── 识别所有 user 轮的起始位置（倒序）────────────────
-  const userIndices: number[] = [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
-      userIndices.push(i);
-      if (userIndices.length >= MAX_KEEP_TURNS) break;
-    }
-  }
-  if (!userIndices.length) {
-    return { messages: [], tokens: 0, dropped: messages.length };
-  }
-
-  // userIndices 是倒序的：[最新user, ..., 最早user]
-  const lastTurnUserIdx = userIndices[0];
-
-  // ── 最新 1 轮：完整保留（截断超长 tool_result）──────
-  const TOOL_MAX = 6000;
-  const lastTurnMsgs = messages.slice(lastTurnUserIdx).map((msg: any) => {
-    if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
-    if (typeof msg.content !== "string") return msg;
-    if (msg.content.length <= TOOL_MAX) return msg;
-    const head = Math.floor(TOOL_MAX * 0.6);
-    const tail = Math.floor(TOOL_MAX * 0.3);
-    return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
-  });
-
-  let lastTurnTokens = 0;
-  for (const msg of lastTurnMsgs) lastTurnTokens += estimateMsgTokens(msg);
-
-  // ── 更早的轮：按轮分组，只保留 user+assistant 纯文本 ──
-  // turns[0] = 最早轮, turns[last] = 倒数第 2 轮
-  type TurnSlice = { msgs: any[]; tokens: number };
-  const olderTurns: TurnSlice[] = [];
-
-  for (let t = userIndices.length - 1; t >= 1; t--) {
-    const startIdx = userIndices[t];
-    const endIdx = userIndices[t - 1]; // next (newer) user turn start
-    const turnMsgs: any[] = [];
-    let turnTokens = 0;
-
-    for (let i = startIdx; i < endIdx; i++) {
-      const msg = messages[i];
-      if (!msg) continue;
-      if (msg.role === "user") {
-        const text = extractUserText(msg);
-        if (text) {
-          const m = { role: "user", content: text };
-          turnMsgs.push(m);
-          turnTokens += estimateMsgTokens(m);
-        }
-      } else if (msg.role === "assistant") {
-        const text = extractAssistantText(msg);
-        if (text) {
-          const m = { role: "assistant", content: text };
-          turnMsgs.push(m);
-          turnTokens += estimateMsgTokens(m);
-        }
-      }
-      // tool / toolResult / thinking 等跳过
-    }
-    if (turnMsgs.length) olderTurns.push({ msgs: turnMsgs, tokens: turnTokens });
-  }
-
-  // ── 按 token 预算从最早轮开始裁剪 ─────────────────────
-  let totalTokens = lastTurnTokens;
-  for (const t of olderTurns) totalTokens += t.tokens;
-
-  let droppedTurns = 0;
-  if (maxTokens && maxTokens > 0) {
-    // 从最早轮（olderTurns[0]）开始逐轮移除
-    while (olderTurns.length > 0 && totalTokens > maxTokens) {
-      const oldest = olderTurns.shift()!;
-      totalTokens -= oldest.tokens;
-      droppedTurns++;
-    }
-  }
-
-  // ── 合并 ─────────────────────────────────────────────
-  const keptMsgs = [
-    ...olderTurns.flatMap((t) => t.msgs),
-    ...lastTurnMsgs,
-  ];
-  const dropped = messages.length - keptMsgs.length;
-
-  return { messages: keptMsgs, tokens: totalTokens, dropped };
-}
 
 export default graphMemoryPlugin;
