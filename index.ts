@@ -334,8 +334,8 @@ const graphMemoryPlugin = {
           return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
         }
 
-        // ── 1. 最后一轮完整对话 ─────────────────────────
-        const lastTurn = sliceLastTurn(messages);
+        // ── 1. 最后一轮完整对话（传入 tokenBudget 以便工具轮压缩）──
+        const lastTurn = sliceLastTurn(messages, tokenBudget);
         const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
         // ── 2. 图谱 + 溯源 ─────────────────────────────
@@ -347,10 +347,13 @@ const graphMemoryPlugin = {
           recalledEdges: rec.edges,
         });
 
-        if (lastTurn.dropped > 0 || episodicTokens > 0) {
+        if (lastTurn.dropped > 0 || episodicTokens > 0 || tokenBudget) {
+          const inputMsgCount = messages.length;
+          const outputMsgCount = lastTurn.messages.length;
           api.logger.info(
-            `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
+            `[graph-memory] assemble: ${outputMsgCount}/${inputMsgCount} msgs (~${lastTurn.tokens} tok), ` +
             `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok` +
+            (tokenBudget ? `, budget=${tokenBudget}` : "") +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
         }
@@ -768,6 +771,8 @@ function estimateMsgTokens(msg: any): number {
 }
 
 const KEEP_TURNS = 5;  // 保留最近 5 轮用户交互
+const LAST_TURN_BUDGET_PCT = 0.6;  // 最后一轮最多占 tokenBudget 的 60%
+const COMPACT_TOOL_MAX = 800;  // 压缩模式下 tool result 最大字符数
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
@@ -816,6 +821,7 @@ function extractUserText(msg: any): string {
 
 function sliceLastTurn(
   messages: any[],
+  tokenBudget?: number,
 ): { messages: any[]; tokens: number; dropped: number } {
   if (!messages.length) {
     return { messages: [], tokens: 0, dropped: 0 };
@@ -839,9 +845,8 @@ function sliceLastTurn(
 
   // ── 最后 1 轮：完整保留（含 toolResult，Agent 需要最新执行结果）──
   let lastTurnMsgs = messages.slice(lastTurnUserIdx);
-  const lastTurnTotal = lastTurnMsgs.length;
 
-  // 截断超长 tool_result
+  // 截断超长 tool_result（基本截断）
   const TOOL_MAX = 6000;
   lastTurnMsgs = lastTurnMsgs.map((msg: any) => {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
@@ -852,14 +857,17 @@ function sliceLastTurn(
     return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
   });
 
+  // ── 工具轮压缩：当最后一轮超出 token 预算时，压缩旧的 tool 轮 ──
+  if (tokenBudget && tokenBudget > 0) {
+    lastTurnMsgs = compactToolRounds(lastTurnMsgs, tokenBudget);
+  }
+
   // ── 前 N-1 轮：只保留 user 输入 + assistant 文本（去掉 tool schema）──
   const prevTurnMsgs: any[] = [];
-  let prevOriginalCount = 0;
 
   if (userIndices.length > 1) {
     // 从最早的 user 到最后一轮 user 之前
     const earliestIdx = userIndices[userIndices.length - 1];
-    prevOriginalCount = lastTurnUserIdx - earliestIdx;
 
     for (let i = earliestIdx; i < lastTurnUserIdx; i++) {
       const msg = messages[i];
@@ -888,6 +896,117 @@ function sliceLastTurn(
   for (const msg of kept) tokens += estimateMsgTokens(msg);
 
   return { messages: kept, tokens, dropped };
+}
+
+/**
+ * 将最后一轮的消息按 "tool round" 分段（每个 assistant + 其 toolResult 为一轮），
+ * 当总 token 数超出预算时，从最旧的 tool round 开始逐步压缩 tool result。
+ *
+ * 保证：
+ *  - 第一条消息（user）和最后一个 tool round 始终完整保留
+ *  - 压缩分两级：先截断到 COMPACT_TOOL_MAX，再折叠为一行占位符
+ */
+function compactToolRounds(lastTurnMsgs: any[], tokenBudget: number): any[] {
+  const maxTokens = Math.floor(tokenBudget * LAST_TURN_BUDGET_PCT);
+  let currentTokens = 0;
+  for (const msg of lastTurnMsgs) currentTokens += estimateMsgTokens(msg);
+
+  // 未超预算，原样返回
+  if (currentTokens <= maxTokens) return lastTurnMsgs;
+
+  // ── 拆分成 tool rounds ───────────────────────────────
+  // round = { assistantIdx, resultIndices[] }
+  // 第一条 user 消息和最后一个 round 不参与压缩
+  interface ToolRound { assistantIdx: number; resultIndices: number[]; }
+  const rounds: ToolRound[] = [];
+  let pending: ToolRound | null = null;
+
+  for (let i = 0; i < lastTurnMsgs.length; i++) {
+    const msg = lastTurnMsgs[i];
+    if (msg.role === "assistant") {
+      // 检查是否包含 tool_use block
+      const hasToolUse = Array.isArray(msg.content) &&
+        msg.content.some((b: any) => b && typeof b === "object" &&
+          (b.type === "tool_use" || b.type === "toolCall" || b.type === "tool-use" || b.type === "function_call"));
+      if (hasToolUse) {
+        if (pending) rounds.push(pending);
+        pending = { assistantIdx: i, resultIndices: [] };
+        continue;
+      }
+    }
+    if ((msg.role === "tool" || msg.role === "toolResult") && pending) {
+      pending.resultIndices.push(i);
+      continue;
+    }
+    // 非 tool round 的消息 → 关闭当前 pending
+    if (pending) { rounds.push(pending); pending = null; }
+  }
+  if (pending) rounds.push(pending);
+
+  // 少于 2 个 tool round → 没有可压缩的旧轮
+  if (rounds.length < 2) return lastTurnMsgs;
+
+  // ── 第一遍：从最旧的 tool round 开始截断 tool result ──
+  const result = [...lastTurnMsgs];
+  // 不压缩最后一个 round（LLM 需要最新的完整结果）
+  const compressibleRounds = rounds.slice(0, -1);
+
+  for (const round of compressibleRounds) {
+    if (currentTokens <= maxTokens) break;
+    for (const idx of round.resultIndices) {
+      const msg = result[idx];
+      if (typeof msg.content !== "string") continue;
+      if (msg.content.length <= COMPACT_TOOL_MAX) continue;
+      const before = estimateMsgTokens(msg);
+      const head = Math.floor(COMPACT_TOOL_MAX * 0.7);
+      const tail = Math.floor(COMPACT_TOOL_MAX * 0.2);
+      result[idx] = {
+        ...msg,
+        content: msg.content.slice(0, head) + `\n...[compacted ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail),
+      };
+      currentTokens -= before - estimateMsgTokens(result[idx]);
+    }
+  }
+
+  if (currentTokens <= maxTokens) return result;
+
+  // ── 第二遍：折叠旧 tool round 的 result 为一行占位符 ──
+  for (const round of compressibleRounds) {
+    if (currentTokens <= maxTokens) break;
+    for (const idx of round.resultIndices) {
+      const msg = result[idx];
+      const before = estimateMsgTokens(msg);
+      const toolName = msg.toolName ?? msg.name ?? "tool";
+      result[idx] = {
+        ...msg,
+        content: `[${toolName} result omitted during context compaction]`,
+      };
+      currentTokens -= before - estimateMsgTokens(result[idx]);
+    }
+  }
+
+  if (currentTokens <= maxTokens) return result;
+
+  // ── 第三遍：strip tool_use blocks from old assistant messages ──
+  for (const round of compressibleRounds) {
+    if (currentTokens <= maxTokens) break;
+    const aIdx = round.assistantIdx;
+    const msg = result[aIdx];
+    if (!Array.isArray(msg.content)) continue;
+    const before = estimateMsgTokens(msg);
+    // Keep only text blocks, remove tool_use blocks
+    const textOnly = msg.content.filter((b: any) =>
+      b && typeof b === "object" && b.type === "text" && typeof b.text === "string"
+    );
+    if (textOnly.length > 0) {
+      result[aIdx] = { ...msg, content: textOnly };
+    } else {
+      result[aIdx] = { ...msg, content: [{ type: "text", text: "[tool calls compacted]" }] };
+    }
+    currentTokens -= before - estimateMsgTokens(result[aIdx]);
+  }
+
+  return result;
 }
 
 export default graphMemoryPlugin;
