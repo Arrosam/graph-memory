@@ -969,6 +969,8 @@ function extractUserText(msg: any): string {
  * - 最新 1 轮：完整保留（含 tool_result，截断超长的）
  * - 更早的轮：只保留 user + assistant 纯文本（去掉 tool schema / thinking）
  * - 从最早轮开始逐轮裁剪，直到 token 预算内或只剩 1 轮
+ * - 若所有旧轮已移除但最新轮自身仍超预算（长 tool-use 循环），
+ *   从该轮内部按 tool step 粒度（assistant+toolResult 组）逐步裁剪旧步骤
  *
  * @param maxTokens 0 或 undefined 表示不限制，使用 MAX_KEEP_TURNS 兜底
  */
@@ -997,7 +999,7 @@ function sliceLastTurn(
 
   // ── 最新 1 轮：完整保留（截断超长 tool_result）──────
   const TOOL_MAX = 6000;
-  const lastTurnMsgs = messages.slice(lastTurnUserIdx).map((msg: any) => {
+  let lastTurnMsgs = messages.slice(lastTurnUserIdx).map((msg: any) => {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
     if (typeof msg.content !== "string") return msg;
     if (msg.content.length <= TOOL_MAX) return msg;
@@ -1055,6 +1057,61 @@ function sliceLastTurn(
       totalTokens -= oldest.tokens;
       droppedTurns++;
     }
+  }
+
+  // ── 最新轮内部裁剪：长时间 tool 调用场景 ────────────
+  // During agentic tool-use loops (assistant→toolResult→assistant→…) the
+  // "last turn" can grow unbounded because there are no user messages to
+  // split on.  When all older turns are gone and the last turn still exceeds
+  // the budget, drop the oldest tool steps (assistant + toolResults groups)
+  // from inside it, keeping the initial user message and the most recent
+  // interactions.  sanitizeToolUseResultPairing() in assemble will fix any
+  // broken tool_use↔toolResult pairings created by the trim.
+  if (maxTokens && maxTokens > 0 && totalTokens > maxTokens && olderTurns.length === 0) {
+    // Separate user prefix from tool steps
+    const userPrefix: any[] = [];
+    let userPrefixTokens = 0;
+    let firstNonUser = 0;
+    for (let i = 0; i < lastTurnMsgs.length; i++) {
+      if (lastTurnMsgs[i].role === "user") {
+        userPrefix.push(lastTurnMsgs[i]);
+        userPrefixTokens += estimateMsgTokens(lastTurnMsgs[i]);
+        firstNonUser = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    // Group remaining messages into tool steps: each starts with an assistant msg
+    type ToolStep = { msgs: any[]; tokens: number };
+    const toolSteps: ToolStep[] = [];
+    let cur: ToolStep | null = null;
+    for (let i = firstNonUser; i < lastTurnMsgs.length; i++) {
+      const msg = lastTurnMsgs[i];
+      if (msg.role === "assistant") {
+        if (cur) toolSteps.push(cur);
+        cur = { msgs: [msg], tokens: estimateMsgTokens(msg) };
+      } else if (cur) {
+        cur.msgs.push(msg);
+        cur.tokens += estimateMsgTokens(msg);
+      } else {
+        cur = { msgs: [msg], tokens: estimateMsgTokens(msg) };
+      }
+    }
+    if (cur) toolSteps.push(cur);
+
+    // Drop oldest tool steps until within budget (keep at least 1 step)
+    let stepTokens = 0;
+    for (const s of toolSteps) stepTokens += s.tokens;
+    totalTokens = userPrefixTokens + stepTokens;
+
+    while (toolSteps.length > 1 && totalTokens > maxTokens) {
+      const oldest = toolSteps.shift()!;
+      totalTokens -= oldest.tokens;
+    }
+
+    lastTurnMsgs = [...userPrefix, ...toolSteps.flatMap((s) => s.msgs)];
+    lastTurnTokens = totalTokens;
   }
 
   // ── 合并 ─────────────────────────────────────────────
