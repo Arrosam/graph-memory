@@ -767,12 +767,18 @@ function estimateMsgTokens(msg: any): number {
   const text = typeof msg.content === "string"
     ? msg.content
     : JSON.stringify(msg.content ?? "");
-  return Math.ceil(text.length / 3);
+  return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-const KEEP_TURNS = 5;  // 保留最近 5 轮用户交互
+const CHARS_PER_TOKEN = 3;
+const KEEP_TURNS = 5;              // 保留最近 5 轮用户交互
+const TOOL_RESULT_MAX_CHARS = 6000;  // 单个 tool result 基本截断阈值
 const LAST_TURN_BUDGET_PCT = 0.6;  // 最后一轮最多占 tokenBudget 的 60%
-const COMPACT_TOOL_MAX = 800;  // 压缩模式下 tool result 最大字符数
+const COMPACT_TOOL_MAX = 800;      // 压缩模式下 tool result 最大字符数
+const TRUNCATE_HEAD_PCT = 0.6;     // 截断时保留头部比例
+const TRUNCATE_TAIL_PCT = 0.3;     // 截断时保留尾部比例
+const COMPACT_HEAD_PCT = 0.7;      // 压缩截断时保留头部比例
+const COMPACT_TAIL_PCT = 0.2;      // 压缩截断时保留尾部比例
 
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
@@ -847,13 +853,12 @@ function sliceLastTurn(
   let lastTurnMsgs = messages.slice(lastTurnUserIdx);
 
   // 截断超长 tool_result（基本截断）
-  const TOOL_MAX = 6000;
   lastTurnMsgs = lastTurnMsgs.map((msg: any) => {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
     if (typeof msg.content !== "string") return msg;
-    if (msg.content.length <= TOOL_MAX) return msg;
-    const head = Math.floor(TOOL_MAX * 0.6);
-    const tail = Math.floor(TOOL_MAX * 0.3);
+    if (msg.content.length <= TOOL_RESULT_MAX_CHARS) return msg;
+    const head = Math.floor(TOOL_RESULT_MAX_CHARS * TRUNCATE_HEAD_PCT);
+    const tail = Math.floor(TOOL_RESULT_MAX_CHARS * TRUNCATE_TAIL_PCT);
     return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
   });
 
@@ -958,8 +963,8 @@ function compactToolRounds(lastTurnMsgs: any[], tokenBudget: number): any[] {
       if (typeof msg.content !== "string") continue;
       if (msg.content.length <= COMPACT_TOOL_MAX) continue;
       const before = estimateMsgTokens(msg);
-      const head = Math.floor(COMPACT_TOOL_MAX * 0.7);
-      const tail = Math.floor(COMPACT_TOOL_MAX * 0.2);
+      const head = Math.floor(COMPACT_TOOL_MAX * COMPACT_HEAD_PCT);
+      const tail = Math.floor(COMPACT_TOOL_MAX * COMPACT_TAIL_PCT);
       result[idx] = {
         ...msg,
         content: msg.content.slice(0, head) + `\n...[compacted ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail),
