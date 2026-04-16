@@ -480,6 +480,7 @@ const graphMemoryPlugin = {
       async compact({
         sessionId,
         sessionKey,
+        tokenBudget,
         currentTokenCount,
         agentId,
         ...rest
@@ -494,11 +495,15 @@ const graphMemoryPlugin = {
         [k: string]: any;
       }) {
         const { db: sdb, recaller: sRecaller } = getSessionResources(sessionId, sessionKey, agentId);
+        const pct = cfg.compactWindowPercent ?? 0.75;
+        const tokBefore = currentTokenCount ?? tokenBudget ?? 0;
+        // Estimate what assemble() will trim to on the next call
+        const tokAfter = tokenBudget ? Math.floor(tokenBudget * pct) : Math.floor(tokBefore * pct);
 
         // 把未提取的消息存入图谱（确保被 assemble 裁剪掉的轮不丢知识）
         const msgs = getUnextracted(sdb, sessionId, 50);
         if (!msgs.length) {
-          return { ok: true, compacted: true, result: { summary: "no unextracted messages", tokensBefore: currentTokenCount ?? 0 } };
+          return { ok: true, compacted: true, result: { summary: "no unextracted messages", tokensBefore: tokBefore, tokensAfter: tokAfter } };
         }
 
         try {
@@ -533,14 +538,16 @@ const graphMemoryPlugin = {
           markExtracted(sdb, sessionId, maxTurn);
 
           api.logger.info(
-            `[graph-memory] compact: extracted ${result.nodes.length} nodes, ${result.edges.length} edges (assemble handles context trimming)`,
+            `[graph-memory] compact: extracted ${result.nodes.length} nodes, ${result.edges.length} edges` +
+            ` (tokensBefore=${tokBefore}, tokensAfter=${tokAfter}, budget=${tokenBudget ?? "∅"})`,
           );
 
           return {
             ok: true, compacted: true,
             result: {
               summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
-              tokensBefore: currentTokenCount ?? 0,
+              tokensBefore: tokBefore,
+              tokensAfter: tokAfter,
             },
           };
         } catch (err) {
