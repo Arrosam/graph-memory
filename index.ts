@@ -19,6 +19,9 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createHash } from "crypto";
+import { readdirSync, existsSync } from "fs";
+import { dirname, basename, extname } from "path";
+import { resolvePath } from "./src/store/db.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Extractor } from "./src/extractor/extract.ts";
@@ -84,9 +87,53 @@ const graphMemoryPlugin = {
         api.logger.info("[graph-memory] FTS5 search mode");
       });
 
-    // Note: the per-agent DB is opened eagerly on session_start / bootstrap.
-    // Opening at register-time would create a default-agent DB that may never
-    // be used (when a real agentId only appears later in session_start).
+    // ── Pre-warm DBs at register-time ──────────────────────
+    // Rather than lazy-opening on the first session_start (which happens when
+    // the user actually sends a message), scan the memory directory for
+    // existing per-agent DB files and open them all upfront. This moves the
+    // open+migrate cost to plugin init so conversation-start is always fast.
+    try {
+      preWarmAllDbs();
+    } catch (err) {
+      api.logger.warn(`[graph-memory] DB pre-warm failed: ${err}`);
+    }
+
+    function preWarmAllDbs(): void {
+      const t0 = Date.now();
+      const opened: string[] = [];
+
+      // Always open the configured base/agent DB (covers cfg.agentId and
+      // shared-mode plugins). Safe even if the file doesn't exist yet —
+      // getDb creates it.
+      sessions.getAgentResources(cfg.agentId);
+      opened.push(cfg.agentId?.trim() || "shared");
+
+      // Scan the directory for per-agent DBs written by previous runs.
+      const resolved = resolvePath(cfg.dbPath);
+      const dir = dirname(resolved);
+      const base = basename(resolved);
+      const ext = extname(base);
+      const stem = ext ? base.slice(0, -ext.length) : base;
+
+      if (!existsSync(dir)) return;
+
+      for (const f of readdirSync(dir)) {
+        if (!f.startsWith(stem + "-")) continue;
+        if (ext && !f.endsWith(ext)) continue;
+        const agentId = f.slice(stem.length + 1, ext ? -ext.length : undefined);
+        if (!agentId) continue;
+        try {
+          sessions.getAgentResources(agentId);
+          opened.push(agentId);
+        } catch (err) {
+          api.logger.warn(`[graph-memory] pre-warm agent=${agentId} failed: ${err}`);
+        }
+      }
+
+      api.logger.info(
+        `[graph-memory] pre-warmed ${opened.length} DB(s) in ${Date.now() - t0}ms: ${opened.join(", ")}`,
+      );
+    }
 
     // ── Session runtime state ─────────────────────────────
     const msgSeq = new Map<string, number>();
