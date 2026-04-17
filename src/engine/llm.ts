@@ -28,11 +28,8 @@ export type CompleteFn = (system: string, user: string) => Promise<string>;
 // ─── 带重试+超时的 fetch ─────────────────────────────────────
 
 const RETRYABLE = new Set([429, 500, 502, 503, 529]);
-const LLM_FETCH_RETRIES = 3;
-const LLM_FETCH_TIMEOUT_MS = 30_000;
-const ERROR_TEXT_MAX_CHARS = 200;
 
-async function fetchRetry(url: string, init: RequestInit, retries = LLM_FETCH_RETRIES, timeoutMs = LLM_FETCH_TIMEOUT_MS): Promise<Response> {
+async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 30_000): Promise<Response> {
   for (let i = 0; i <= retries; i++) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -121,7 +118,7 @@ export function createCompleteFn(
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      throw new Error(`[graph-memory] LLM API ${res.status}: ${errText.slice(0, ERROR_TEXT_MAX_CHARS)}`);
+      throw new Error(`[graph-memory] LLM API ${res.status}: ${errText.slice(0, 200)}`);
     }
     const data = await res.json() as any;
     const text = data.choices?.[0]?.message?.content ?? "";

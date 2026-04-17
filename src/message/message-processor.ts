@@ -143,9 +143,6 @@ export function extractUserText(msg: any): string {
 
 const MIN_KEEP_TURNS = 1;
 const MAX_KEEP_TURNS = 10;
-const TOOL_RESULT_MAX_CHARS = 6000;
-const TOOL_RESULT_HEAD_RATIO = 0.6;
-const TOOL_RESULT_TAIL_RATIO = 0.3;
 
 export interface SliceResult {
   messages: any[];
@@ -184,12 +181,13 @@ export function sliceLastTurn(messages: any[], maxTokens?: number): SliceResult 
   const lastTurnUserIdx = userIndices[0];
 
   // Latest turn: full messages with oversized tool_result truncation
+  const TOOL_MAX = 6000;
   let lastTurnMsgs = messages.slice(lastTurnUserIdx).map((msg: any) => {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
     if (typeof msg.content !== "string") return msg;
-    if (msg.content.length <= TOOL_RESULT_MAX_CHARS) return msg;
-    const head = Math.floor(TOOL_RESULT_MAX_CHARS * TOOL_RESULT_HEAD_RATIO);
-    const tail = Math.floor(TOOL_RESULT_MAX_CHARS * TOOL_RESULT_TAIL_RATIO);
+    if (msg.content.length <= TOOL_MAX) return msg;
+    const head = Math.floor(TOOL_MAX * 0.6);
+    const tail = Math.floor(TOOL_MAX * 0.3);
     return {
       ...msg,
       content:

@@ -17,9 +17,6 @@ import type { CompleteFn } from "../engine/llm.ts";
 import { upsertNode, upsertEdge, findByName, getStats } from "../store/store.ts";
 import { runMaintenance } from "../graph/maintenance.ts";
 
-const SEARCH_CONTENT_MAX_CHARS = 400;
-const STATS_TOP_K = 5;
-
 export function registerTools(
   api: OpenClawPluginApi,
   sessions: SessionManager,
@@ -54,7 +51,7 @@ function registerSearchTool(api: OpenClawPluginApi, sessions: SessionManager): v
 
         const lines = res.nodes.map(
           (n) =>
-            `[${n.type}] ${n.name} (pr:${n.pagerank.toFixed(3)})\n${n.description}\n${n.content.slice(0, SEARCH_CONTENT_MAX_CHARS)}`,
+            `[${n.type}] ${n.name} (pr:${n.pagerank.toFixed(3)})\n${n.description}\n${n.content.slice(0, 400)}`,
         );
         const edgeLines = res.edges.map((e) => {
           const from = res.nodes.find((n) => n.id === e.fromId)?.name ?? e.fromId;
@@ -148,7 +145,7 @@ function registerStatsTool(api: OpenClawPluginApi, sessions: SessionManager): vo
         const stats = getStats(db);
         const topPr = db
           .prepare(
-            `SELECT name, type, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT ${STATS_TOP_K}`,
+            "SELECT name, type, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 5",
           )
           .all() as any[];
 
@@ -157,7 +154,7 @@ function registerStatsTool(api: OpenClawPluginApi, sessions: SessionManager): vo
           `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
           `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
           `社区：${stats.communities} 个`,
-          `PageRank Top ${STATS_TOP_K}：`,
+          `PageRank Top 5：`,
           ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
         ].join("\n");
         return {
@@ -192,13 +189,13 @@ function registerMaintainTool(
           `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
           ...(result.dedup.pairs.length > 0
             ? result.dedup.pairs
-                .slice(0, STATS_TOP_K)
+                .slice(0, 5)
                 .map((p) => `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)
             : []),
           `社区：${result.community.count} 个`,
-          `PageRank Top ${STATS_TOP_K}：`,
+          `PageRank Top 5：`,
           ...result.pagerank.topK
-            .slice(0, STATS_TOP_K)
+            .slice(0, 5)
             .map((n, i) => `  ${i + 1}. ${n.name} (${n.score.toFixed(4)})`),
         ].join("\n");
         return {

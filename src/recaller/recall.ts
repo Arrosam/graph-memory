@@ -29,10 +29,6 @@ import {
 import { getCommunityPeers } from "../graph/community.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
 
-const COMMUNITY_PEER_LIMIT = 2;
-const GENERALIZED_WALK_DEPTH = 1;
-const EMBED_CONTENT_SLICE = 500;
-
 export class Recaller {
   private embed: EmbedFn | null = null;
 
@@ -97,7 +93,7 @@ export class Recaller {
     // 社区扩展
     const expandedIds = new Set(seedIds);
     for (const seed of seeds) {
-      const peers = getCommunityPeers(this.db, seed.id, COMMUNITY_PEER_LIMIT);
+      const peers = getCommunityPeers(this.db, seed.id, 2);
       for (const peerId of peers) expandedIds.add(peerId);
     }
 
@@ -168,7 +164,7 @@ export class Recaller {
     if (!seeds.length) return { nodes: [], edges: [], tokenEstimate: 0 };
 
     const seedIds = seeds.map(n => n.id);
-    const { nodes, edges } = graphWalk(this.db, seedIds, GENERALIZED_WALK_DEPTH);
+    const { nodes, edges } = graphWalk(this.db, seedIds, 1);
     if (!nodes.length) return { nodes: [], edges: [], tokenEstimate: 0 };
 
     const candidateIds = nodes.map(n => n.id);
@@ -239,7 +235,7 @@ export class Recaller {
   /** 异步同步 embedding，不阻塞主流程 */
   async syncEmbed(node: GmNode): Promise<void> {
     if (!this.embed) return;
-    const embedSource = `${node.name}: ${node.description}\n${node.content.slice(0, EMBED_CONTENT_SLICE)}`;
+    const embedSource = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
     const hash = createHash("md5").update(embedSource).digest("hex");
     if (getVectorHash(this.db, node.id) === hash) return;
     try {

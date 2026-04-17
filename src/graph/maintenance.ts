@@ -49,7 +49,7 @@ export async function runMaintenance(
   const pagerankResult = computeGlobalPageRank(db, cfg);
 
   // 3. 社区检测
-  const communityResult = detectCommunities(db, cfg.communityMaxIterations);
+  const communityResult = detectCommunities(db);
 
   // 4. 社区描述生成（需要 LLM）
   let communitySummaries = 0;
