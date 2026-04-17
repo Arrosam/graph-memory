@@ -40,12 +40,9 @@ import {
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
 import { SessionManager } from "./src/session/session-manager.ts";
 import { registerTools } from "./src/tools/register-tools.ts";
-import {
-  readProviderModel,
-  cleanPrompt,
-  normalizeMessageContent,
-  sliceLastTurn,
-} from "./src/message/message-processor.ts";
+import { readProviderModel } from "./src/message/config.ts";
+import { cleanPrompt, normalizeMessageContent } from "./src/message/normalize.ts";
+import { sliceLastTurn } from "./src/message/slice.ts";
 
 // ─── Plugin Object ───────────────────────────────────────────
 
