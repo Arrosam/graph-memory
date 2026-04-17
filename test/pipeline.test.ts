@@ -16,12 +16,8 @@ import { createTestDb } from "./helpers.ts";
 import { drainExtractAndPersist } from "../src/extractor/pipeline.ts";
 import { Extractor } from "../src/extractor/extract.ts";
 import { Recaller } from "../src/recaller/recall.ts";
-import {
-  saveMessage,
-  allActiveNodes,
-  getUnextracted,
-  allEdges,
-} from "../src/store/store.ts";
+import { saveMessage, getUnextracted } from "../src/store/messages.ts";
+import { allActiveNodes, allEdges } from "../src/store/nodes.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "../src/types.ts";
 
 // ─── Fakes ───────────────────────────────────────────────────

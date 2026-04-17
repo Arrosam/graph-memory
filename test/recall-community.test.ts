@@ -15,11 +15,13 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
+import { findById } from "../src/store/nodes.ts";
+import { vectorSearchWithScore, communityRepresentatives } from "../src/store/search.ts";
+import { saveVector } from "../src/store/vectors.ts";
 import {
-  findById, vectorSearchWithScore, communityRepresentatives,
-  saveVector, upsertCommunitySummary, getCommunitySummary,
+  upsertCommunitySummary, getCommunitySummary,
   getAllCommunitySummaries, pruneCommunitySummaries,
-} from "../src/store/store.ts";
+} from "../src/store/communities.ts";
 import { detectCommunities, getCommunityPeers } from "../src/graph/community.ts";
 import { assembleContext } from "../src/format/assemble.ts";
 import type { GmNode } from "../src/types.ts";

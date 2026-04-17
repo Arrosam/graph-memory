@@ -29,7 +29,7 @@
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmConfig } from "../types.ts";
-import { updatePageranks } from "../store/store.ts";
+import { updatePageranks } from "../store/nodes.ts";
 
 // ─── 图结构缓存（避免每次 recall 都查 SQL） ─────────────────
 

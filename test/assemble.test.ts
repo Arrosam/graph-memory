@@ -10,7 +10,7 @@ import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite"
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
 import { assembleContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "../src/format/transcript-repair.ts";
-import { findById } from "../src/store/store.ts";
+import { findById } from "../src/store/nodes.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
 
 let db: DatabaseSyncInstance;

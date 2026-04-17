@@ -14,7 +14,7 @@ import { personalizedPageRank, computeGlobalPageRank, invalidateGraphCache } fro
 import { detectCommunities, getCommunityPeers } from "../src/graph/community.ts";
 import { detectDuplicates, dedup } from "../src/graph/dedup.ts";
 import { runMaintenance } from "../src/graph/maintenance.ts";
-import { saveVector } from "../src/store/store.ts";
+import { saveVector } from "../src/store/vectors.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "../src/types.ts";
 
 let db: DatabaseSyncInstance;

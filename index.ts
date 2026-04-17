@@ -32,11 +32,11 @@ import { runMaintenance } from "./src/graph/maintenance.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
 import {
-  saveMessage,
   upsertNode, upsertEdge, findByName,
   getBySession, edgesFrom, edgesTo,
   deprecate,
-} from "./src/store/store.ts";
+} from "./src/store/nodes.ts";
+import { saveMessage } from "./src/store/messages.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
 import { SessionManager } from "./src/session/session-manager.ts";
 import { registerTools } from "./src/tools/register-tools.ts";

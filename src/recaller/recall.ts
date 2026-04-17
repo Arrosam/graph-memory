@@ -24,8 +24,8 @@ import {
   searchNodes, vectorSearchWithScore,
   graphWalk, communityRepresentatives,
   communityVectorSearch, nodesByCommunityIds,
-  saveVector, getVectorHash,
-} from "../store/store.ts";
+} from "../store/search.ts";
+import { saveVector, getVectorHash } from "../store/vectors.ts";
 import { getCommunityPeers } from "../graph/community.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
 

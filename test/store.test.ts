@@ -11,11 +11,15 @@ import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
 import {
   findByName, findById, upsertNode, upsertEdge, deprecate,
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
-  searchNodes, topNodes, graphWalk, getBySession,
+  getBySession,
+} from "../src/store/nodes.ts";
+import { searchNodes, topNodes, graphWalk, vectorSearch } from "../src/store/search.ts";
+import {
   saveMessage, getMessages, getUnextracted, markExtracted,
   saveSignal, pendingSignals, markSignalsDone,
-  getStats, saveVector, vectorSearch, getAllVectors,
-} from "../src/store/store.ts";
+} from "../src/store/messages.ts";
+import { saveVector, getAllVectors } from "../src/store/vectors.ts";
+import { getStats } from "../src/store/common.ts";
 
 let db: DatabaseSyncInstance;
 

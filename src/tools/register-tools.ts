@@ -14,7 +14,8 @@ import type { SessionManager } from "../session/session-manager.ts";
 import type { GmConfig } from "../types.ts";
 import { normalizeNodeType } from "../types.ts";
 import type { CompleteFn } from "../engine/llm.ts";
-import { upsertNode, upsertEdge, findByName, getStats } from "../store/store.ts";
+import { upsertNode, upsertEdge, findByName } from "../store/nodes.ts";
+import { getStats } from "../store/common.ts";
 import { runMaintenance } from "../graph/maintenance.ts";
 
 export function registerTools(

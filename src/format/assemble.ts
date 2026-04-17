@@ -7,7 +7,8 @@
 
 import { type DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
-import { getCommunitySummary, getEpisodicMessages } from "../store/store.ts";
+import { getCommunitySummary } from "../store/communities.ts";
+import { getEpisodicMessages } from "../store/messages.ts";
 
 const CHARS_PER_TOKEN = 3;
 

@@ -13,9 +13,8 @@ import {
   upsertEdge,
   findByName,
   getBySession,
-  markExtracted,
-  getUnextracted,
-} from "../store/store.ts";
+} from "../store/nodes.ts";
+import { markExtracted, getUnextracted } from "../store/messages.ts";
 import { invalidateGraphCache } from "../graph/pagerank.ts";
 
 export interface PipelineResult {
