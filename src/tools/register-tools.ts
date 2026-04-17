@@ -40,6 +40,12 @@ function registerSearchTool(api: OpenClawPluginApi, sessions: SessionManager): v
       }),
       async execute(_toolCallId: string, params: { query: string }) {
         const { query } = params;
+        if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
+          return {
+            content: [{ type: "text", text: "graph-memory 未启用：当前上下文无 agentId。" }],
+            details: { error: "no_agent_id", query },
+          };
+        }
         const { recaller } = sessions.getAgentResources(ctx?.agentId);
         const res = await recaller.recall(query);
         if (!res.nodes.length) {
@@ -95,6 +101,12 @@ function registerRecordTool(api: OpenClawPluginApi, sessions: SessionManager): v
         p: { name: string; type: string; description: string; content: string; relatedSkill?: string },
       ) {
         const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+        if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
+          return {
+            content: [{ type: "text", text: "graph-memory 未启用：当前上下文无 agentId。" }],
+            details: { error: "no_agent_id" },
+          };
+        }
         const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
         const nodeType = normalizeNodeType(p.type);
         if (!nodeType) {
@@ -141,6 +153,12 @@ function registerStatsTool(api: OpenClawPluginApi, sessions: SessionManager): vo
       description: "查看知识图谱的统计信息：节点数、边数、社区数、PageRank Top 节点。",
       parameters: Type.Object({}),
       async execute(_toolCallId: string, _params: any) {
+        if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
+          return {
+            content: [{ type: "text", text: "graph-memory 未启用：当前上下文无 agentId。" }],
+            details: { error: "no_agent_id" },
+          };
+        }
         const { db } = sessions.getAgentResources(ctx?.agentId);
         const stats = getStats(db);
         const topPr = db
@@ -181,6 +199,12 @@ function registerMaintainTool(
         "手动触发图维护：运行去重、PageRank 重算、社区检测。通常 session_end 时自动运行，这个工具用于手动触发。",
       parameters: Type.Object({}),
       async execute(_toolCallId: string, _params: any) {
+        if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
+          return {
+            content: [{ type: "text", text: "graph-memory 未启用：当前上下文无 agentId。" }],
+            details: { error: "no_agent_id" },
+          };
+        }
         const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
         const embedFn = recaller.getEmbedFn() ?? undefined;
         const result = await runMaintenance(db, cfg, llm, embedFn);

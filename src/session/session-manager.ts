@@ -40,6 +40,20 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Peek whether an agentId can be resolved for a session without opening
+   * any DB. Mirrors getSessionResources' resolution order: explicit agent,
+   * cfg fallback, previously-bound session map, or sessionKey pattern.
+   */
+  canResolveAgent(sessionId?: string, sessionKey?: string, agentId?: string): boolean {
+    if (agentId?.trim()) return true;
+    if (this.cfg.agentId?.trim()) return true;
+    if (sessionKey && this.sessionAgentMap.has(sessionKey)) return true;
+    if (sessionId && this.sessionAgentMap.has(sessionId)) return true;
+    if (sessionKey && /(?:^|:)agent:([^:]+)/.test(sessionKey)) return true;
+    return false;
+  }
+
   /** Bind a session to an agent identity from context. */
   bindSession(ctx: any): void {
     const aid = ctx?.agentId?.trim();
@@ -55,22 +69,29 @@ export class SessionManager {
     return this.sessionAgentMap.has(sessionId);
   }
 
-  /** Get DB + Recaller for a given agentId (lazy-creates on first use). */
+  /**
+   * Get DB + Recaller for a given agentId (lazy-creates on first use).
+   *
+   * Strict mode: agentId (or cfg.agentId fallback) is required. Callers
+   * without a resolvable agentId get an error — the plugin refuses to open
+   * the unscoped "shared" DB so cross-agent data never mixes.
+   */
   getAgentResources(agentId?: string): AgentResources {
     const aid = agentId?.trim() || this.cfg.agentId?.trim() || "";
+    if (!aid) {
+      throw new Error("[graph-memory] no agentId resolvable; refusing to open shared DB");
+    }
     let cached = this.agentCache.get(aid);
     if (cached) return cached;
 
-    const path = resolveAgentDbPath(this.cfg.dbPath, aid || undefined);
+    const path = resolveAgentDbPath(this.cfg.dbPath, aid);
     const agentDb = getDb(path);
     const agentRecaller = new Recaller(agentDb, this.cfg);
     if (this.sharedEmbedFn) agentRecaller.setEmbedFn(this.sharedEmbedFn);
 
     cached = { db: agentDb, recaller: agentRecaller };
     this.agentCache.set(aid, cached);
-    this.logger.info(
-      `[graph-memory] initialized DB: ${path}` + (aid ? ` (agent=${aid})` : " (shared)"),
-    );
+    this.logger.info(`[graph-memory] initialized DB: ${path} (agent=${aid})`);
     return cached;
   }
 

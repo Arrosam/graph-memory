@@ -102,13 +102,20 @@ const graphMemoryPlugin = {
       const t0 = Date.now();
       const opened: string[] = [];
 
-      // Always open the configured base/agent DB (covers cfg.agentId and
-      // shared-mode plugins). Safe even if the file doesn't exist yet —
-      // getDb creates it.
-      sessions.getAgentResources(cfg.agentId);
-      opened.push(cfg.agentId?.trim() || "shared");
+      // Only pre-open DBs tied to a concrete agentId. No shared fallback —
+      // we don't create the unscoped base DB under any circumstance.
+      if (cfg.agentId?.trim()) {
+        try {
+          sessions.getAgentResources(cfg.agentId);
+          opened.push(cfg.agentId.trim());
+        } catch (err) {
+          api.logger.warn(`[graph-memory] pre-warm cfg.agentId failed: ${err}`);
+        }
+      }
 
       // Scan the directory for per-agent DBs written by previous runs.
+      // Files matching "<stem>-<agentId><ext>" only — bare "<stem><ext>"
+      // (the legacy shared DB) is intentionally skipped.
       const resolved = resolvePath(cfg.dbPath);
       const dir = dirname(resolved);
       const base = basename(resolved);
@@ -122,6 +129,7 @@ const graphMemoryPlugin = {
         if (ext && !f.endsWith(ext)) continue;
         const agentId = f.slice(stem.length + 1, ext ? -ext.length : undefined);
         if (!agentId) continue;
+        if (opened.includes(agentId)) continue;
         try {
           sessions.getAgentResources(agentId);
           opened.push(agentId);
@@ -131,7 +139,7 @@ const graphMemoryPlugin = {
       }
 
       api.logger.info(
-        `[graph-memory] pre-warmed ${opened.length} DB(s) in ${Date.now() - t0}ms: ${opened.join(", ")}`,
+        `[graph-memory] pre-warmed ${opened.length} agent DB(s) in ${Date.now() - t0}ms: ${opened.join(", ") || "(none)"}`,
       );
     }
 
@@ -276,6 +284,9 @@ const graphMemoryPlugin = {
       sessions.bindSession(ctx);
       // Warm the per-agent DB so the first before_prompt_build / ingest
       // doesn't pay the open+migrate cost on the critical path.
+      if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
+        return;
+      }
       try {
         sessions.getAgentResources(ctx?.agentId);
       } catch (err) {
@@ -293,6 +304,7 @@ const graphMemoryPlugin = {
           );
         }
         sessions.bindSession(ctx);
+        if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) return;
 
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
         const prompt = cleanPrompt(rawPrompt);
@@ -347,6 +359,9 @@ const graphMemoryPlugin = {
           const aid = agentId.trim();
           if (aid && sessionId) sessions.bindSession({ agentId: aid, sessionId, sessionKey });
         }
+        if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) {
+          return { bootstrapped: false };
+        }
         // Eagerly open the agent DB here too — bootstrap runs before any
         // context-engine call, so this is the right moment to pay the cost.
         try {
@@ -363,13 +378,21 @@ const graphMemoryPlugin = {
         sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean; agentId?: string; [k: string]: any;
       }) {
         if (isHeartbeat) return { ingested: false };
+        if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) {
+          return { ingested: false };
+        }
         if (!sessions.hasSession(sessionId)) {
           const extraKeys = Object.keys(rest).join(",");
           api.logger.info(
             `[graph-memory] ingest first-seen sid=${sessionId.slice(0, 8)} agentId=${agentId ?? "∅"} sessionKey=${(sessionKey ?? "∅").slice(0, 30)} extraKeys=[${extraKeys}]`,
           );
         }
-        ingestMessage(sessionId, message, sessionKey, agentId);
+        try {
+          ingestMessage(sessionId, message, sessionKey, agentId);
+        } catch (err) {
+          api.logger.warn(`[graph-memory] ingest failed: ${err}`);
+          return { ingested: false };
+        }
         return { ingested: true };
       },
 
@@ -378,6 +401,14 @@ const graphMemoryPlugin = {
       }: {
         sessionId: string; sessionKey?: string; messages: any[]; tokenBudget?: number; prompt?: string; agentId?: string; [k: string]: any;
       }) {
+        // No agent resolvable → pass messages through untouched; no graph context.
+        if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) {
+          const passthrough = sliceLastTurn(messages, undefined);
+          return {
+            messages: normalizeMessageContent(passthrough.messages),
+            estimatedTokens: passthrough.tokens,
+          };
+        }
         const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
         const activeNodes = getBySession(db, sessionId);
         const activeEdges = activeNodes.flatMap((n) => [
@@ -465,6 +496,9 @@ const graphMemoryPlugin = {
         force?: boolean; currentTokenCount?: number; agentId?: string; [k: string]: any;
       }) {
         const tokensBefore = currentTokenCount ?? 0;
+        if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) {
+          return { ok: false, compacted: false, reason: "no agentId" };
+        }
         try {
           // Share the per-session extract chain with afterTurn — no double-LLM race.
           const counts = await scheduleExtract(sessionId, sessionKey, agentId);
@@ -538,6 +572,7 @@ const graphMemoryPlugin = {
         tokenBudget?: number; agentId?: string; [k: string]: any;
       }) {
         if (isHeartbeat) return;
+        if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) return;
 
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
         const totalMsgs = msgSeq.get(sessionId) ?? 0;
@@ -656,6 +691,15 @@ const graphMemoryPlugin = {
       const sid =
         ctx?.sessionKey ?? ctx?.sessionId ?? event?.sessionKey ?? event?.sessionId;
       if (!sid) return;
+
+      // No agentId ever bound to this session → nothing to finalize. Clean
+      // up in-memory state and skip the finalize/maintenance work that would
+      // otherwise try to open a DB we never created.
+      if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
+        clearSessionState(ctx?.sessionId, ctx?.sessionKey, event?.sessionId, event?.sessionKey);
+        sessions.cleanupSession(ctx?.sessionId, ctx?.sessionKey);
+        return;
+      }
 
       try {
         const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
