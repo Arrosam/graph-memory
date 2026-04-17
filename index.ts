@@ -81,6 +81,16 @@ const graphMemoryPlugin = {
         api.logger.info("[graph-memory] FTS5 search mode");
       });
 
+    // ── Eagerly open the default/shared DB ────────────────
+    // Lazy init would push the migrate + WAL + mkdir cost onto the first
+    // event (ingest/recall), making the first real turn feel sluggish.
+    // Open it now so every hot-path call just hits the agentCache Map.
+    try {
+      sessions.getAgentResources(cfg.agentId);
+    } catch (err) {
+      api.logger.error(`[graph-memory] eager DB init failed: ${err}`);
+    }
+
     // ── Session runtime state ─────────────────────────────
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
@@ -187,6 +197,13 @@ const graphMemoryPlugin = {
         `[graph-memory] session_start ctx keys=[${ctx ? Object.keys(ctx).join(",") : "null"}] agentId=${ctx?.agentId ?? "∅"} sessionId=${(ctx?.sessionId ?? "∅").slice(0, 8)} sessionKey=${(ctx?.sessionKey ?? "∅").slice(0, 20)}`,
       );
       sessions.bindSession(ctx);
+      // Warm the per-agent DB so the first before_prompt_build / ingest
+      // doesn't pay the open+migrate cost on the critical path.
+      try {
+        sessions.getAgentResources(ctx?.agentId);
+      } catch (err) {
+        api.logger.warn(`[graph-memory] session_start DB warm-up failed: ${err}`);
+      }
     });
 
     // ── before_prompt_build: recall ───────────────────────
@@ -236,6 +253,13 @@ const graphMemoryPlugin = {
         if (agentId) {
           const aid = agentId.trim();
           if (aid && sessionId) sessions.bindSession({ agentId: aid, sessionId, sessionKey });
+        }
+        // Eagerly open the agent DB here too — bootstrap runs before any
+        // context-engine call, so this is the right moment to pay the cost.
+        try {
+          sessions.getAgentResources(agentId);
+        } catch (err) {
+          api.logger.warn(`[graph-memory] bootstrap DB warm-up failed: ${err}`);
         }
         return { bootstrapped: true };
       },
