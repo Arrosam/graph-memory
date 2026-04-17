@@ -21,14 +21,14 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Extractor } from "./src/extractor/extract.ts";
-import { extractAndPersist } from "./src/extractor/pipeline.ts";
+import { drainExtractAndPersist } from "./src/extractor/pipeline.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.ts";
 import { detectCommunities } from "./src/graph/community.ts";
 import {
-  saveMessage, getUnextracted,
+  saveMessage,
   upsertNode, upsertEdge, findByName,
   getBySession, edgesFrom, edgesTo,
   deprecate,
@@ -85,7 +85,41 @@ const graphMemoryPlugin = {
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
     const turnCounter = new Map<string, number>();
-    const extractChain = new Map<string, Promise<void>>();
+    // extractChain: per-session Promise chain shared by afterTurn + compact
+    // so the two extract paths can never race on the same unextracted rows.
+    const extractChain = new Map<string, Promise<unknown>>();
+    // Recall is expensive (embed + FTS); skip if the same prompt already recalled.
+    const recallPromptHash = new Map<string, string>();
+
+    function hashPrompt(s: string): string {
+      let h = 5381;
+      for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+      return String(h);
+    }
+
+    /** Schedule a drain-extract serialized per session; returns totals. */
+    function scheduleExtract(
+      sessionId: string, sessionKey?: string, agentId?: string,
+    ): Promise<{ nodes: number; edges: number }> {
+      const prev = extractChain.get(sessionId) ?? Promise.resolve({ nodes: 0, edges: 0 });
+      const next = prev.then(async () => {
+        try {
+          const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
+          const r = await drainExtractAndPersist(db, recaller, extractor, sessionId);
+          if (r.nodesExtracted || r.edgesExtracted) {
+            api.logger.info(
+              `[graph-memory] extracted ${r.nodesExtracted} nodes [${r.nodeDetails}], ${r.edgesExtracted} edges [${r.edgeDetails}] (${r.batches} batch${r.batches === 1 ? "" : "es"})`,
+            );
+          }
+          return { nodes: r.nodesExtracted, edges: r.edgesExtracted };
+        } catch (err) {
+          api.logger.error(`[graph-memory] extract failed: ${err}`);
+          return { nodes: 0, edges: 0 };
+        }
+      });
+      extractChain.set(sessionId, next);
+      return next;
+    }
 
     // ── Helpers ───────────────────────────────────────────
 
@@ -107,27 +141,8 @@ const graphMemoryPlugin = {
       sessionId: string, newMessages: any[], sessionKey?: string, agentId?: string,
     ): Promise<void> {
       if (!newMessages.length) return;
-
-      const prev = extractChain.get(sessionId) ?? Promise.resolve();
-      const next = prev.then(async () => {
-        try {
-          const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
-          const msgs = getUnextracted(db, sessionId, 50);
-          if (!msgs.length) return;
-
-          const result = await extractAndPersist(db, recaller, extractor, sessionId, msgs);
-
-          if (result.nodesExtracted || result.edgesExtracted) {
-            api.logger.info(
-              `[graph-memory] extracted ${result.nodesExtracted} nodes [${result.nodeDetails}], ${result.edgesExtracted} edges [${result.edgeDetails}]`,
-            );
-          }
-        } catch (err) {
-          api.logger.error(`[graph-memory] turn extract failed: ${err}`);
-        }
-      });
-      extractChain.set(sessionId, next);
-      return next;
+      // Route through scheduleExtract so compact + afterTurn share the chain.
+      await scheduleExtract(sessionId, sessionKey, agentId);
     }
 
     // ── session_start ─────────────────────────────────────
@@ -222,14 +237,20 @@ const graphMemoryPlugin = {
         if (prompt) {
           const cleaned = cleanPrompt(prompt);
           if (cleaned) {
-            try {
-              const freshRec = await recaller.recall(cleaned);
-              if (freshRec.nodes.length) {
-                rec = freshRec;
-                recalled.set(sessionId, freshRec);
+            // before_prompt_build already ran for this prompt; skip re-embedding
+            // unless the prompt actually changed.
+            const h = hashPrompt(cleaned);
+            if (recallPromptHash.get(sessionId) !== h) {
+              try {
+                const freshRec = await recaller.recall(cleaned);
+                if (freshRec.nodes.length) {
+                  rec = freshRec;
+                  recalled.set(sessionId, freshRec);
+                }
+                recallPromptHash.set(sessionId, h);
+              } catch (err) {
+                api.logger.warn(`[graph-memory] assemble recall failed: ${err}`);
               }
-            } catch (err) {
-              api.logger.warn(`[graph-memory] assemble recall failed: ${err}`);
             }
           }
         }
@@ -270,35 +291,48 @@ const graphMemoryPlugin = {
           systemPromptAddition = parts.join("\n\n");
         }
 
+        // estimatedTokens must cover: messages + graph XML + episodic + prompt prefix.
+        // gmTokens already includes xml; episodic is separate; systemPromptAddition
+        // is a superset — use its length as an upper bound to avoid double-count.
+        const sysTok = systemPromptAddition ? Math.ceil(systemPromptAddition.length / 3) : 0;
+        const totalTok = Math.max(gmTokens + episodicTokens, sysTok) + lastTurn.tokens;
+
         return {
           messages: normalizeMessageContent(repaired),
-          estimatedTokens: gmTokens + lastTurn.tokens,
+          estimatedTokens: totalTok,
           ...(systemPromptAddition ? { systemPromptAddition } : {}),
         };
       },
 
       async compact({
-        sessionId, sessionKey, currentTokenCount, agentId,
+        sessionId, sessionKey, tokenBudget, currentTokenCount, agentId,
       }: {
         sessionId: string; sessionKey?: string; sessionFile: string; tokenBudget?: number;
         force?: boolean; currentTokenCount?: number; agentId?: string; [k: string]: any;
       }) {
-        const { db, recaller } = sessions.getSessionResources(sessionId, sessionKey, agentId);
-        const msgs = getUnextracted(db, sessionId, 50);
-        if (!msgs.length) {
-          return { ok: true, compacted: true, result: { summary: "no unextracted messages", tokensBefore: currentTokenCount ?? 0 } };
-        }
-
+        const tokensBefore = currentTokenCount ?? 0;
         try {
-          const result = await extractAndPersist(db, recaller, extractor, sessionId, msgs);
+          // Share the per-session extract chain with afterTurn — no double-LLM race.
+          const counts = await scheduleExtract(sessionId, sessionKey, agentId);
+
+          // Actual message trimming is performed by assemble(). Report the
+          // tokens assemble WILL produce so the host sees real progress.
+          const pct = cfg.compactWindowPercent ?? 0.75;
+          const tokensAfter = tokenBudget
+            ? Math.min(tokensBefore || Number.MAX_SAFE_INTEGER, Math.floor(tokenBudget * pct))
+            : tokensBefore;
+
           api.logger.info(
-            `[graph-memory] compact: extracted ${result.nodesExtracted} nodes, ${result.edgesExtracted} edges (assemble handles context trimming)`,
+            `[graph-memory] compact: extracted ${counts.nodes} nodes, ${counts.edges} edges; ` +
+            `tokensBefore=${tokensBefore} tokensAfter~${tokensAfter} (assemble will apply trim)`,
           );
+
           return {
             ok: true, compacted: true,
             result: {
-              summary: `extracted ${result.nodesExtracted} nodes, ${result.edgesExtracted} edges`,
-              tokensBefore: currentTokenCount ?? 0,
+              summary: `extracted ${counts.nodes} nodes, ${counts.edges} edges`,
+              tokensBefore,
+              tokensAfter,
             },
           };
         } catch (err) {
@@ -380,6 +414,7 @@ const graphMemoryPlugin = {
 
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
         recalled.delete(childSessionKey);
+        recallPromptHash.delete(childSessionKey);
         msgSeq.delete(childSessionKey);
         sessions.cleanupSession(childSessionKey);
       },
@@ -388,6 +423,7 @@ const graphMemoryPlugin = {
         extractChain.clear();
         msgSeq.clear();
         recalled.clear();
+        recallPromptHash.clear();
         turnCounter.clear();
         sessions.dispose();
       },
@@ -453,6 +489,7 @@ const graphMemoryPlugin = {
         extractChain.delete(sid);
         msgSeq.delete(sid);
         recalled.delete(sid);
+        recallPromptHash.delete(sid);
         turnCounter.delete(sid);
         sessions.cleanupSession(ctx?.sessionId, ctx?.sessionKey);
       }

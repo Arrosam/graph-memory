@@ -141,8 +141,9 @@ export function extractUserText(msg: any): string {
 
 // ─── Conversation Slicing ────────────────────────────────────
 
-const MIN_KEEP_TURNS = 1;
-const MAX_KEEP_TURNS = 10;
+// Upper bound on turns scanned from the tail. Actual trimming is budget-driven;
+// this cap just bounds work when the conversation is huge.
+const MAX_KEEP_TURNS = 50;
 
 export interface SliceResult {
   messages: any[];

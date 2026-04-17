@@ -14,6 +14,7 @@ import {
   findByName,
   getBySession,
   markExtracted,
+  getUnextracted,
 } from "../store/store.ts";
 import { invalidateGraphCache } from "../graph/pagerank.ts";
 
@@ -86,5 +87,49 @@ export async function extractAndPersist(
     edgesExtracted: result.edges.length,
     nodeDetails: result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", "),
     edgeDetails: result.edges.map((e: any) => `${e.from}→[${e.type}]→${e.to}`).join(", "),
+  };
+}
+
+/**
+ * Drain all unextracted messages for a session in batches.
+ *
+ * Why: single-call `getUnextracted(db, sid, 50)` drops knowledge when a turn
+ * produces more than 50 unextracted messages (long tool-chains). This loops
+ * until the queue is empty or a safety cap is reached.
+ */
+export async function drainExtractAndPersist(
+  db: DatabaseSyncInstance,
+  recaller: Recaller,
+  extractor: Extractor,
+  sessionId: string,
+  batchSize: number = 50,
+  maxBatches: number = 5,
+): Promise<PipelineResult & { batches: number }> {
+  let totalNodes = 0;
+  let totalEdges = 0;
+  const nodeDetailsAll: string[] = [];
+  const edgeDetailsAll: string[] = [];
+  let batches = 0;
+
+  for (; batches < maxBatches; batches++) {
+    const msgs = getUnextracted(db, sessionId, batchSize);
+    if (!msgs.length) break;
+
+    const r = await extractAndPersist(db, recaller, extractor, sessionId, msgs);
+    totalNodes += r.nodesExtracted;
+    totalEdges += r.edgesExtracted;
+    if (r.nodeDetails) nodeDetailsAll.push(r.nodeDetails);
+    if (r.edgeDetails) edgeDetailsAll.push(r.edgeDetails);
+
+    // Queue drained — no need for another round trip
+    if (msgs.length < batchSize) break;
+  }
+
+  return {
+    nodesExtracted: totalNodes,
+    edgesExtracted: totalEdges,
+    nodeDetails: nodeDetailsAll.join(" | "),
+    edgeDetails: edgeDetailsAll.join(" | "),
+    batches: batches + (totalNodes || totalEdges ? 1 : 0),
   };
 }
