@@ -18,6 +18,7 @@
  *   - This file         — thin orchestration layer only
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { createHash } from "crypto";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Extractor } from "./src/extractor/extract.ts";
@@ -57,7 +58,9 @@ const graphMemoryPlugin = {
       api.pluginConfig && typeof api.pluginConfig === "object"
         ? (api.pluginConfig as any)
         : {};
-    const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
+    // Deep-merge for nested objects (llm, embedding) so user overriding a single
+    // field like { llm: { model: "x" } } doesn't wipe the other defaults.
+    const cfg: GmConfig = mergeConfig(DEFAULT_CONFIG, raw);
     const { provider, model } = readProviderModel(api.config);
 
     // ── Core dependencies ─────────────────────────────────
@@ -81,15 +84,9 @@ const graphMemoryPlugin = {
         api.logger.info("[graph-memory] FTS5 search mode");
       });
 
-    // ── Eagerly open the default/shared DB ────────────────
-    // Lazy init would push the migrate + WAL + mkdir cost onto the first
-    // event (ingest/recall), making the first real turn feel sluggish.
-    // Open it now so every hot-path call just hits the agentCache Map.
-    try {
-      sessions.getAgentResources(cfg.agentId);
-    } catch (err) {
-      api.logger.error(`[graph-memory] eager DB init failed: ${err}`);
-    }
+    // Note: the per-agent DB is opened eagerly on session_start / bootstrap.
+    // Opening at register-time would create a default-agent DB that may never
+    // be used (when a real agentId only appears later in session_start).
 
     // ── Session runtime state ─────────────────────────────
     const msgSeq = new Map<string, number>();
@@ -101,10 +98,10 @@ const graphMemoryPlugin = {
     // Recall is expensive (embed + FTS); skip if the same prompt already recalled.
     const recallPromptHash = new Map<string, string>();
 
+    // Non-crypto-strong but collision-resistant enough for cache dedupe.
+    // Use SHA-256 prefix — DJB2's 32-bit space gets crowded on long prompts.
     function hashPrompt(s: string): string {
-      let h = 5381;
-      for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-      return String(h);
+      return createHash("sha256").update(s).digest("hex").slice(0, 16);
     }
 
     /**
@@ -118,10 +115,7 @@ const graphMemoryPlugin = {
      * that as "unbounded" to preserve legacy behavior for hosts that don't
      * supply a budget.
      */
-    function splitBudget(
-      tokenBudget: number | undefined,
-      cfg: GmConfig,
-    ): {
+    function splitBudget(tokenBudget: number | undefined): {
       msgBudget: number | undefined;
       graphBudget: number;
       episodicBudget: number;
@@ -140,6 +134,36 @@ const graphMemoryPlugin = {
         target,
         pct,
       };
+    }
+
+    /** Delete entries from all session state maps under every provided key. */
+    function clearSessionState(...keys: Array<string | undefined>): void {
+      const set = new Set(keys.filter((k): k is string => !!k));
+      for (const k of set) {
+        extractChain.delete(k);
+        msgSeq.delete(k);
+        recalled.delete(k);
+        recallPromptHash.delete(k);
+        turnCounter.delete(k);
+      }
+    }
+
+    /** Read a per-session map by sessionId with sessionKey fallback. */
+    function readSessionState<V>(m: Map<string, V>, sessionId?: string, sessionKey?: string): V | undefined {
+      if (sessionId) {
+        const v = m.get(sessionId);
+        if (v !== undefined) return v;
+      }
+      if (sessionKey && sessionKey !== sessionId) return m.get(sessionKey);
+      return undefined;
+    }
+
+    /** Check if the last message in the array is a tool result (tool-loop). */
+    function isToolLoopTail(msgs: unknown): boolean {
+      if (!Array.isArray(msgs) || !msgs.length) return false;
+      const last = (msgs as any[])[msgs.length - 1];
+      const role = last?.role;
+      return role === "tool" || role === "toolResult" || role === "tool_result";
     }
 
     /** Schedule a drain-extract serialized per session; returns totals. */
@@ -223,23 +247,20 @@ const graphMemoryPlugin = {
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
         // Tool-loop short-circuit: if the host supplied messages and the last
-        // one is a tool result, we're mid tool-call chain — the user prompt
-        // hasn't changed since turn start, so don't re-embed.
-        const msgs = Array.isArray(event?.messages) ? event.messages : null;
-        if (msgs && msgs.length) {
-          const last = msgs[msgs.length - 1];
-          const role = last?.role;
-          if (role === "tool" || role === "toolResult" || role === "tool_result") {
-            return;
-          }
+        // one is a tool result, we're mid tool-call chain — user prompt hasn't
+        // changed, don't re-embed. We also seed the hash so assemble()'s own
+        // guard skips too (previous turn had already populated `recalled`).
+        const sid = ctx?.sessionId;
+        const sk = ctx?.sessionKey;
+        const h = hashPrompt(prompt);
+        if (isToolLoopTail(event?.messages)) {
+          if (sid) recallPromptHash.set(sid, h);
+          return;
         }
 
-        // Hash guard: dedupe across turns (tool-loop and repeated builds).
-        // Without this, every host re-invocation awaits a full embed + search
-        // even when the user prompt hasn't changed.
-        const sid = ctx?.sessionId;
-        const h = hashPrompt(prompt);
-        if (sid && recallPromptHash.get(sid) === h) {
+        // Hash guard: dedupe across turns. Check both sessionId and sessionKey
+        // (subagents may have state populated under sessionKey only).
+        if (readSessionState(recallPromptHash, sid, sk) === h) {
           return; // already recalled this exact prompt for this session
         }
 
@@ -248,12 +269,8 @@ const graphMemoryPlugin = {
         const { recaller } = sessions.getAgentResources(ctx?.agentId);
         const res = await recaller.recall(prompt);
         if (sid) recallPromptHash.set(sid, h);
+        if (res.nodes.length && sid) recalled.set(sid, res);
         if (res.nodes.length) {
-          if (sid) recalled.set(sid, res);
-          if (ctx?.sessionKey && ctx.sessionKey !== sid) {
-            recalled.set(ctx.sessionKey, res);
-            recallPromptHash.set(ctx.sessionKey, h);
-          }
           api.logger.info(
             `[graph-memory] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`,
           );
@@ -315,14 +332,18 @@ const graphMemoryPlugin = {
           ...edgesTo(db, n.id),
         ]);
 
-        let rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
+        let rec = readSessionState(recalled, sessionId, sessionKey) ?? { nodes: [], edges: [] };
         if (prompt) {
           const cleaned = cleanPrompt(prompt);
           if (cleaned) {
-            // before_prompt_build already ran for this prompt; skip re-embedding
-            // unless the prompt actually changed.
             const h = hashPrompt(cleaned);
-            if (recallPromptHash.get(sessionId) !== h) {
+            const cachedHash = readSessionState(recallPromptHash, sessionId, sessionKey);
+            // Skip recall if:
+            //  (a) hash already matches (before_prompt_build already did it), or
+            //  (b) the host is in a tool-loop — the user prompt hasn't changed
+            //      and re-embedding mid-chain blocks the agent.
+            const inToolLoop = isToolLoopTail(messages);
+            if (cachedHash !== h && !inToolLoop) {
               try {
                 const freshRec = await recaller.recall(cleaned);
                 if (freshRec.nodes.length) {
@@ -338,7 +359,7 @@ const graphMemoryPlugin = {
         }
 
         const totalGmNodes = activeNodes.length + rec.nodes.length;
-        const { msgBudget, graphBudget, episodicBudget, target, pct } = splitBudget(tokenBudget, cfg);
+        const { msgBudget, graphBudget, episodicBudget, target, pct } = splitBudget(tokenBudget);
 
         if (totalGmNodes === 0) {
           const trimmed = sliceLastTurn(messages, msgBudget);
@@ -398,7 +419,7 @@ const graphMemoryPlugin = {
           // Actual message trimming happens in assemble(). Project what assemble
           // WILL produce by running assembleContext against current graph state
           // (pure, no side effects) and combining with the message budget cap.
-          const { msgBudget, graphBudget, episodicBudget } = splitBudget(tokenBudget, cfg);
+          const { msgBudget, graphBudget, episodicBudget } = splitBudget(tokenBudget);
 
           const { db } = sessions.getSessionResources(sessionId, sessionKey, agentId);
           const activeNodes = getBySession(db, sessionId);
@@ -406,7 +427,7 @@ const graphMemoryPlugin = {
             ...edgesFrom(db, n.id),
             ...edgesTo(db, n.id),
           ]);
-          const rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
+          const rec = readSessionState(recalled, sessionId, sessionKey) ?? { nodes: [], edges: [] };
           const { tokens: gmTokens } = assembleContext(db, {
             tokenBudget: graphBudget,
             episodicTokenBudget: episodicBudget,
@@ -416,21 +437,29 @@ const graphMemoryPlugin = {
             recalledEdges: rec.edges,
           });
 
-          // Upper bound: messages capped to msgBudget + graph + episodic.
-          // Never claim an after-size larger than before.
-          const msgCap = msgBudget && msgBudget > 0 ? msgBudget : tokensBefore;
-          const projected = Math.min(tokensBefore || Number.MAX_SAFE_INTEGER, msgCap) + gmTokens;
-          const tokensAfter = tokensBefore > 0 ? Math.min(tokensBefore, projected) : projected;
+          // Project the after-size. If we don't know tokensBefore (host didn't
+          // pass currentTokenCount), report the cap as the best we can offer.
+          // Otherwise: the real message portion is capped to min(msgBudget, currentMsgs)
+          // but we only know the total, so we use min(tokensBefore, msgBudget)
+          // as an upper bound for the trimmed messages.
+          let tokensAfter: number;
+          if (tokensBefore > 0 && msgBudget && msgBudget > 0) {
+            tokensAfter = Math.min(tokensBefore, msgBudget + gmTokens);
+          } else if (msgBudget && msgBudget > 0) {
+            tokensAfter = msgBudget + gmTokens;
+          } else {
+            tokensAfter = tokensBefore; // no budget given → can't project
+          }
 
-          // Only claim compacted:true if we actually shrunk (or extracted fresh nodes
-          // that will let future recalls replace raw messages).
+          // Only claim compacted:true if we actually shrunk (or extracted fresh
+          // nodes that will let future recalls replace raw messages).
           const didShrink = tokensBefore > 0 && tokensAfter < tokensBefore;
           const didExtract = counts.nodes > 0 || counts.edges > 0;
 
           api.logger.info(
             `[graph-memory] compact: extracted ${counts.nodes} nodes, ${counts.edges} edges; ` +
             `tokensBefore=${tokensBefore} tokensAfter~${tokensAfter} ` +
-            `(msgCap ${msgCap}, graph+episodic ${gmTokens})`,
+            `(msgBudget ${msgBudget ?? "∅"}, graph+episodic ${gmTokens})`,
           );
 
           return {
@@ -510,19 +539,21 @@ const graphMemoryPlugin = {
       }) {
         const rec = recalled.get(parentSessionKey);
         if (rec) recalled.set(childSessionKey, rec);
+        // Propagate the hash too so the child's first before_prompt_build
+        // skips re-embedding if the prompt is identical to parent's.
+        const parentHash = recallPromptHash.get(parentSessionKey);
+        if (parentHash) recallPromptHash.set(childSessionKey, parentHash);
         sessions.propagateSession(parentSessionKey, childSessionKey);
         return {
           rollback: () => {
-            recalled.delete(childSessionKey);
+            clearSessionState(childSessionKey);
             sessions.cleanupSession(childSessionKey);
           },
         };
       },
 
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
-        recalled.delete(childSessionKey);
-        recallPromptHash.delete(childSessionKey);
-        msgSeq.delete(childSessionKey);
+        clearSessionState(childSessionKey);
         sessions.cleanupSession(childSessionKey);
       },
 
@@ -593,11 +624,10 @@ const graphMemoryPlugin = {
       } catch (err) {
         api.logger.error(`[graph-memory] session_end error: ${err}`);
       } finally {
-        extractChain.delete(sid);
-        msgSeq.delete(sid);
-        recalled.delete(sid);
-        recallPromptHash.delete(sid);
-        turnCounter.delete(sid);
+        // Clean up under every known key. Writers may have used sessionId
+        // (ingest/assemble/afterTurn) while pre-populated state from subagent
+        // spawn used sessionKey — we need to hit both to avoid leaks.
+        clearSessionState(ctx?.sessionId, ctx?.sessionKey, event?.sessionId, event?.sessionKey);
         sessions.cleanupSession(ctx?.sessionId, ctx?.sessionKey);
       }
     });
@@ -614,3 +644,27 @@ const graphMemoryPlugin = {
 };
 
 export default graphMemoryPlugin;
+
+// ─── Config merge ────────────────────────────────────────────
+
+/**
+ * Merge user plugin config over defaults. Plain objects (llm, embedding) are
+ * merged one level deep so a partial override like `{ llm: { model: "x" } }`
+ * doesn't wipe other default fields in `llm`. Arrays and non-plain values are
+ * replaced wholesale.
+ */
+function mergeConfig(defaults: GmConfig, user: Record<string, any>): GmConfig {
+  const out: any = { ...defaults };
+  for (const [k, v] of Object.entries(user)) {
+    const d = (defaults as any)[k];
+    if (
+      v && typeof v === "object" && !Array.isArray(v) &&
+      d && typeof d === "object" && !Array.isArray(d)
+    ) {
+      out[k] = { ...d, ...v };
+    } else if (v !== undefined) {
+      out[k] = v;
+    }
+  }
+  return out as GmConfig;
+}

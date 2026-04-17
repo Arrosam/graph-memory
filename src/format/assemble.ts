@@ -5,7 +5,7 @@
  * Email: Wywelljob@gmail.com
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import { type DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
 import { getCommunitySummary, getEpisodicMessages } from "../store/store.ts";
 
