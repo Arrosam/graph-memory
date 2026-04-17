@@ -45,6 +45,7 @@ interface GraphStructure {
 
 const _cachedGraphs = new WeakMap<DatabaseSyncInstance, GraphStructure>();
 const CACHE_TTL = 30_000; // 30 秒缓存
+const GLOBAL_PR_TOP_K = 20;
 
 /**
  * 读取图结构（带缓存，按 db 实例隔离）
@@ -239,7 +240,7 @@ export function computeGlobalPageRank(db: DatabaseSyncInstance, cfg: GmConfig): 
 
   const sorted = Array.from(rank.entries())
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
+    .slice(0, GLOBAL_PR_TOP_K)
     .map(([id, score]) => ({ id, name: nameMap.get(id) || id, score }));
 
   return { scores: rank, topK: sorted };

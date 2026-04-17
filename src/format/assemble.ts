@@ -10,6 +10,10 @@ import type { GmNode, GmEdge } from "../types.ts";
 import { getCommunitySummary, getEpisodicMessages } from "../store/store.ts";
 
 const CHARS_PER_TOKEN = 3;
+const EPISODIC_TOP_NODES = 3;
+const EPISODIC_DISPLAY_MAX_CHARS = 200;
+const RICH_NODE_THRESHOLD = 4;
+const RICH_EDGE_THRESHOLD = 3;
 
 /**
  * 构建知识图谱的 system prompt 引导文字
@@ -26,7 +30,7 @@ export function buildSystemPromptAddition(params: {
   const skillCount = selectedNodes.filter(n => n.type === "SKILL").length;
   const eventCount = selectedNodes.filter(n => n.type === "EVENT").length;
   const taskCount = selectedNodes.filter(n => n.type === "TASK").length;
-  const isRich = selectedNodes.length >= 4 || edgeCount >= 3;
+  const isRich = selectedNodes.length >= RICH_NODE_THRESHOLD || edgeCount >= RICH_EDGE_THRESHOLD;
 
   const sections: string[] = [];
 
@@ -173,7 +177,7 @@ export function assembleContext(
   });
 
   // ── 溯源选拉：PPR top 3 节点 → 拉原始 user/assistant 对话 ──
-  const topNodes = selected.slice(0, 3);
+  const topNodes = selected.slice(0, EPISODIC_TOP_NODES);
   const episodicParts: string[] = [];
 
   for (const node of topNodes) {
@@ -184,7 +188,7 @@ export function assembleContext(
     if (!msgs.length) continue;
 
     const lines = msgs.map(m =>
-      `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
+      `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, EPISODIC_DISPLAY_MAX_CHARS))}`
     ).join("\n");
     episodicParts.push(`  <trace node="${node.name}">\n${lines}\n  </trace>`);
   }

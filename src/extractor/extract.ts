@@ -11,6 +11,9 @@ import type { CompleteFn } from "../engine/llm.ts";
 
 // ─── 节点/边合法值 ──────────────────────────────────────────────
 
+const EXTRACT_MSG_MAX_CHARS = 800;
+const DEBUG_OUTPUT_MAX_CHARS = 2000;
+
 const VALID_EDGE_TYPES = new Set(["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"]);
 
 /** 边类型 → 合法的 from 节点类型 */
@@ -233,7 +236,7 @@ export class Extractor {
   }): Promise<ExtractionResult> {
     const msgs = params.messages
       .map(m => `[${(m.role ?? "?").toUpperCase()} t=${m.turn_index ?? 0}]\n${
-        String(typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 800)
+        String(typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, EXTRACT_MSG_MAX_CHARS)
       }`).join("\n\n---\n\n");
 
     const raw = await this.llm(
@@ -243,7 +246,7 @@ export class Extractor {
 
     if (process.env.GM_DEBUG) {
       console.log("\n  [DEBUG] LLM raw response (first 2000 chars):");
-      console.log("  " + raw.slice(0, 2000).replace(/\n/g, "\n  "));
+      console.log("  " + raw.slice(0, DEBUG_OUTPUT_MAX_CHARS).replace(/\n/g, "\n  "));
     }
 
     return this.parseExtract(raw);

@@ -9,6 +9,13 @@ import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite"
 import { createHash, randomUUID } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType, Signal } from "../types.ts";
 
+// ─── 常量 ─────────────────────────────────────────────────────
+
+const FTS_TERM_LIMIT = 8;
+const DEFAULT_SEARCH_LIMIT = 6;
+const EPISODIC_TEXT_MAX_CHARS = 300;
+const DEFAULT_VECTOR_MIN_SCORE = 0.35;
+
 // ─── 工具 ─────────────────────────────────────────────────────
 
 function uid(p: string): string {
@@ -205,8 +212,8 @@ function fts5Available(db: DatabaseSyncInstance): boolean {
   return result;
 }
 
-export function searchNodes(db: DatabaseSyncInstance, query: string, limit = 6): GmNode[] {
-  const terms = query.trim().split(/\s+/).filter(Boolean).slice(0, 8);
+export function searchNodes(db: DatabaseSyncInstance, query: string, limit = DEFAULT_SEARCH_LIMIT): GmNode[] {
+  const terms = query.trim().split(/\s+/).filter(Boolean).slice(0, FTS_TERM_LIMIT);
   if (!terms.length) return topNodes(db, limit);
 
   if (fts5Available(db)) {
@@ -231,7 +238,7 @@ export function searchNodes(db: DatabaseSyncInstance, query: string, limit = 6):
 }
 
 /** 热门节点：综合 pagerank + validatedCount 排序 */
-export function topNodes(db: DatabaseSyncInstance, limit = 6): GmNode[] {
+export function topNodes(db: DatabaseSyncInstance, limit = DEFAULT_SEARCH_LIMIT): GmNode[] {
   return (db.prepare(`
     SELECT * FROM gm_nodes WHERE status='active'
     ORDER BY pagerank DESC, validated_count DESC, updated_at DESC LIMIT ?
@@ -343,7 +350,7 @@ export function getEpisodicMessages(
       SELECT turn_index, role, content, created_at FROM gm_messages
       WHERE session_id = ? AND role IN ('user', 'assistant')
       ORDER BY ABS(created_at - ?) ASC
-      LIMIT 6
+      LIMIT ${DEFAULT_SEARCH_LIMIT}
     `).all(sid, nearTime) as any[];
 
     for (const r of rows) {
@@ -361,10 +368,10 @@ export function getEpisodicMessages(
             .map((b: any) => b.text ?? "")
             .join("\n");
         } else {
-          text = String(parsed).slice(0, 300);
+          text = String(parsed).slice(0, EPISODIC_TEXT_MAX_CHARS);
         }
       } catch {
-        text = String(r.content).slice(0, 300);
+        text = String(r.content).slice(0, EPISODIC_TEXT_MAX_CHARS);
       }
 
       if (!text.trim()) continue;
@@ -458,7 +465,7 @@ export function getAllVectors(db: DatabaseSyncInstance): Array<{ nodeId: string;
 
 export type ScoredNode = { node: GmNode; score: number };
 
-export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number[], limit: number, minScore = 0.35): ScoredNode[] {
+export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number[], limit: number, minScore = DEFAULT_VECTOR_MIN_SCORE): ScoredNode[] {
   const rows = db.prepare(`
     SELECT v.node_id, v.embedding, n.*
     FROM gm_vectors v JOIN gm_nodes n ON n.id = v.node_id
@@ -489,7 +496,7 @@ export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number
 }
 
 /** 兼容旧接口 */
-export function vectorSearch(db: DatabaseSyncInstance, queryVec: number[], limit: number, minScore = 0.35): GmNode[] {
+export function vectorSearch(db: DatabaseSyncInstance, queryVec: number[], limit: number, minScore = DEFAULT_VECTOR_MIN_SCORE): GmNode[] {
   return vectorSearchWithScore(db, queryVec, limit, minScore).map(s => s.node);
 }
 

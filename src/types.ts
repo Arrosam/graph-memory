@@ -150,6 +150,12 @@ export interface GmConfig {
   pagerankIterations: number;
   /** Context window 使用率阈值 (0-1)，超过后开始从最早一轮压缩。默认 0.75 */
   compactWindowPercent: number;
+  /** 向量搜索最低余弦相似度 (0-1)，低于此值的结果被过滤。默认 0.35 */
+  vectorMinScore: number;
+  /** 社区检测（标签传播）最大迭代次数。默认 50 */
+  communityMaxIterations: number;
+  /** 发送到 Embedding API 的最大文本字符数。默认 8000 */
+  embedMaxInputLength: number;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
@@ -162,4 +168,7 @@ export const DEFAULT_CONFIG: GmConfig = {
   pagerankDamping: 0.85,
   pagerankIterations: 20,
   compactWindowPercent: 0.75,
+  vectorMinScore: 0.35,
+  communityMaxIterations: 50,
+  embedMaxInputLength: 8000,
 };

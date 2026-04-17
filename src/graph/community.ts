@@ -27,6 +27,9 @@
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { updateCommunities } from "../store/store.ts";
 
+const DEFAULT_COMMUNITY_MAX_ITER = 50;
+const COMMUNITY_SUMMARY_MAX_CHARS = 100;
+
 export interface CommunityResult {
   labels: Map<string, string>;
   /** 社区 ID → 成员节点 ID 列表 */
@@ -39,7 +42,7 @@ export interface CommunityResult {
  *
  * 把有向边当无向边处理（知识关联不分方向）
  */
-export function detectCommunities(db: DatabaseSyncInstance, maxIter = 50): CommunityResult {
+export function detectCommunities(db: DatabaseSyncInstance, maxIter = DEFAULT_COMMUNITY_MAX_ITER): CommunityResult {
   // 读取活跃节点
   const nodeRows = db.prepare(
     "SELECT id FROM gm_nodes WHERE status='active'"
@@ -221,7 +224,7 @@ export async function summarizeCommunities(
         .replace(/\n/g, " ")
         .replace(/\s{2,}/g, " ")
         .trim()
-        .slice(0, 100);
+        .slice(0, COMMUNITY_SUMMARY_MAX_CHARS);
 
       if (cleaned.length === 0) continue;
 

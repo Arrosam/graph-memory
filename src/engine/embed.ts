@@ -42,8 +42,11 @@ export type EmbedFn = (text: string) => Promise<number[]>;
 // ─── 带重试+超时的 fetch ─────────────────────────────────────
 
 const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+const EMBED_FETCH_RETRIES = 3;
+const EMBED_FETCH_TIMEOUT_MS = 10_000;
+const ERROR_TEXT_MAX_CHARS = 200;
 
-async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 10_000): Promise<Response> {
+async function fetchRetry(url: string, init: RequestInit, retries = EMBED_FETCH_RETRIES, timeoutMs = EMBED_FETCH_TIMEOUT_MS): Promise<Response> {
   for (let i = 0; i <= retries; i++) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -94,7 +97,7 @@ export async function createEmbedFn(cfg: GmConfig, log?: (msg: string) => void):
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      throw new Error(`[graph-memory] Embedding API ${res.status}: ${errText.slice(0, 200)}`);
+      throw new Error(`[graph-memory] Embedding API ${res.status}: ${errText.slice(0, ERROR_TEXT_MAX_CHARS)}`);
     }
 
     const data = await res.json() as any;
@@ -111,7 +114,7 @@ export async function createEmbedFn(cfg: GmConfig, log?: (msg: string) => void):
     if (!probe.length) return null;
 
     return async (text: string): Promise<number[]> => {
-      return callEmbedding(text.slice(0, 8000));
+      return callEmbedding(text.slice(0, cfg.embedMaxInputLength));
     };
   } catch (err) {
     console.error(`[graph-memory] embedding probe failed:`, err);
