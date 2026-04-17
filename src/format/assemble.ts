@@ -74,27 +74,41 @@ export function buildSystemPromptAddition(params: {
   return sections.join("\n");
 }
 
+/** 估算单个节点渲染为 XML 的 token 数 */
+function estimateNodeXmlTokens(n: GmNode): number {
+  // <tag name="..." desc="..." source="recalled" updated="YYYY-MM-DD">\ncontent\n  </tag>
+  const chars =
+    60 +
+    n.name.length +
+    (n.description?.length ?? 0) +
+    (n.content?.length ?? 0);
+  return Math.ceil(chars / CHARS_PER_TOKEN);
+}
+
 /**
  * 组装知识图谱为 XML context
+ *
+ * @param params.tokenBudget         图谱 XML 的 token 预算。>0 时按预算截断节点；0 = 不截断（遗留行为）
+ * @param params.episodicTokenBudget episodic 上下文的 token 预算。>0 时按预算截断；0/缺省 = 按字符软上限
  */
 export function assembleContext(
   db: DatabaseSyncInstance,
   params: {
     tokenBudget: number;
+    episodicTokenBudget?: number;
     activeNodes: GmNode[];
     activeEdges: GmEdge[];
     recalledNodes: GmNode[];
     recalledEdges: GmEdge[];
   },
 ): { xml: string | null; systemPrompt: string; tokens: number; episodicXml: string; episodicTokens: number } {
-  // recall 返回多少节点就放多少，不截断
   const map = new Map<string, GmNode & { src: "active" | "recalled" }>();
   for (const n of params.recalledNodes) map.set(n.id, { ...n, src: "recalled" });
   for (const n of params.activeNodes) map.set(n.id, { ...n, src: "active" });
 
   // 排序：本 session > SKILL优先 > validatedCount > 全局pagerank基线
   const TYPE_PRI: Record<string, number> = { SKILL: 3, TASK: 2, EVENT: 1 };
-  const sorted = Array.from(map.values())
+  const candidates = Array.from(map.values())
     .filter(n => n.status === "active")
     .sort((a, b) =>
       (a.src === b.src ? 0 : a.src === "active" ? -1 : 1) ||
@@ -103,8 +117,22 @@ export function assembleContext(
       b.pagerank - a.pagerank
     );
 
-  // recall 返回的已经是 PPR 排序过的，全量放入
-  const selected = sorted;
+  // 按 tokenBudget 截断（>0 时生效）；0 表示无限制（保留遗留测试语义）
+  let selected: typeof candidates;
+  if (params.tokenBudget > 0) {
+    selected = [];
+    // Reserve overhead for <knowledge_graph>, <community>, <edges> wrappers
+    const WRAPPER_OVERHEAD = 40;
+    let used = WRAPPER_OVERHEAD;
+    for (const n of candidates) {
+      const est = estimateNodeXmlTokens(n);
+      if (used + est > params.tokenBudget && selected.length > 0) break;
+      selected.push(n);
+      used += est;
+    }
+  } else {
+    selected = candidates;
+  }
 
   if (!selected.length) return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
 
@@ -175,18 +203,31 @@ export function assembleContext(
   // ── 溯源选拉：PPR top 3 节点 → 拉原始 user/assistant 对话 ──
   const topNodes = selected.slice(0, 3);
   const episodicParts: string[] = [];
+  const episodicBudget = params.episodicTokenBudget ?? 0;
+  let episodicUsed = 0;
+
+  // 按预算分摊每节点字符上限；无预算时按原 500 字符软上限
+  const perNodeCharCap = episodicBudget > 0
+    ? Math.max(200, Math.floor((episodicBudget * CHARS_PER_TOKEN) / Math.max(1, topNodes.length)))
+    : 500;
 
   for (const node of topNodes) {
     if (!node.sourceSessions?.length) continue;
     // 取最近的 2 个 session
     const recentSessions = node.sourceSessions.slice(-2);
-    const msgs = getEpisodicMessages(db, recentSessions, node.updatedAt, 500);
+    const msgs = getEpisodicMessages(db, recentSessions, node.updatedAt, perNodeCharCap);
     if (!msgs.length) continue;
 
     const lines = msgs.map(m =>
       `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
     ).join("\n");
-    episodicParts.push(`  <trace node="${node.name}">\n${lines}\n  </trace>`);
+    const chunk = `  <trace node="${node.name}">\n${lines}\n  </trace>`;
+    const chunkTok = Math.ceil(chunk.length / CHARS_PER_TOKEN);
+
+    // 预算硬上限：超出就停（至少保留一条）
+    if (episodicBudget > 0 && episodicUsed + chunkTok > episodicBudget && episodicParts.length > 0) break;
+    episodicParts.push(chunk);
+    episodicUsed += chunkTok;
   }
 
   const episodicXml = episodicParts.length

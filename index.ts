@@ -97,6 +97,41 @@ const graphMemoryPlugin = {
       return String(h);
     }
 
+    /**
+     * Split tokenBudget into msg / graph / episodic portions.
+     *
+     * Target window = tokenBudget * compactWindowPercent.
+     * Within the window: 70% msgs / 20% graph / 10% episodic (10% slack left for
+     * host overhead, system prompts host adds, etc.).
+     *
+     * All values are 0 / undefined when tokenBudget is unset — callers treat
+     * that as "unbounded" to preserve legacy behavior for hosts that don't
+     * supply a budget.
+     */
+    function splitBudget(
+      tokenBudget: number | undefined,
+      cfg: GmConfig,
+    ): {
+      msgBudget: number | undefined;
+      graphBudget: number;
+      episodicBudget: number;
+      target: number;
+      pct: number;
+    } {
+      const pct = cfg.compactWindowPercent ?? 0.75;
+      const target = tokenBudget ? Math.floor(tokenBudget * pct) : 0;
+      if (!target) {
+        return { msgBudget: undefined, graphBudget: 0, episodicBudget: 0, target: 0, pct };
+      }
+      return {
+        msgBudget: Math.floor(target * 0.70),
+        graphBudget: Math.floor(target * 0.20),
+        episodicBudget: Math.floor(target * 0.10),
+        target,
+        pct,
+      };
+    }
+
     /** Schedule a drain-extract serialized per session; returns totals. */
     function scheduleExtract(
       sessionId: string, sessionKey?: string, agentId?: string,
@@ -256,19 +291,19 @@ const graphMemoryPlugin = {
         }
 
         const totalGmNodes = activeNodes.length + rec.nodes.length;
-        const pct = cfg.compactWindowPercent ?? 0.75;
-        const maxTok = tokenBudget ? Math.floor(tokenBudget * pct) : undefined;
+        const { msgBudget, graphBudget, episodicBudget, target, pct } = splitBudget(tokenBudget, cfg);
 
         if (totalGmNodes === 0) {
-          const trimmed = sliceLastTurn(messages, maxTok);
+          const trimmed = sliceLastTurn(messages, msgBudget);
           return { messages: normalizeMessageContent(trimmed.messages), estimatedTokens: trimmed.tokens };
         }
 
-        const lastTurn = sliceLastTurn(messages, maxTok);
+        const lastTurn = sliceLastTurn(messages, msgBudget);
         const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
         const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, {
-          tokenBudget: 0,
+          tokenBudget: graphBudget,
+          episodicTokenBudget: episodicBudget,
           activeNodes,
           activeEdges,
           recalledNodes: rec.nodes,
@@ -279,7 +314,7 @@ const graphMemoryPlugin = {
           api.logger.info(
             `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
             `dropped ${lastTurn.dropped} older msgs` +
-            (maxTok ? ` (budget ${maxTok} tok, ${Math.round(pct * 100)}% of ${tokenBudget})` : "") +
+            (target ? ` (target ${target}=${Math.round(pct * 100)}% of ${tokenBudget}; msg ${msgBudget}, graph ${graphBudget}, episodic ${episodicBudget})` : "") +
             `, graph ~${gmTokens} tok` +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
@@ -291,11 +326,9 @@ const graphMemoryPlugin = {
           systemPromptAddition = parts.join("\n\n");
         }
 
-        // estimatedTokens must cover: messages + graph XML + episodic + prompt prefix.
-        // gmTokens already includes xml; episodic is separate; systemPromptAddition
-        // is a superset — use its length as an upper bound to avoid double-count.
-        const sysTok = systemPromptAddition ? Math.ceil(systemPromptAddition.length / 3) : 0;
-        const totalTok = Math.max(gmTokens + episodicTokens, sysTok) + lastTurn.tokens;
+        // gmTokens already covers systemPrompt + xml + episodic (assembleContext
+        // computes it from the joined string). Just sum with message tokens.
+        const totalTok = lastTurn.tokens + gmTokens;
 
         return {
           messages: normalizeMessageContent(repaired),
@@ -315,20 +348,47 @@ const graphMemoryPlugin = {
           // Share the per-session extract chain with afterTurn — no double-LLM race.
           const counts = await scheduleExtract(sessionId, sessionKey, agentId);
 
-          // Actual message trimming is performed by assemble(). Report the
-          // tokens assemble WILL produce so the host sees real progress.
-          const pct = cfg.compactWindowPercent ?? 0.75;
-          const tokensAfter = tokenBudget
-            ? Math.min(tokensBefore || Number.MAX_SAFE_INTEGER, Math.floor(tokenBudget * pct))
-            : tokensBefore;
+          // Actual message trimming happens in assemble(). Project what assemble
+          // WILL produce by running assembleContext against current graph state
+          // (pure, no side effects) and combining with the message budget cap.
+          const { msgBudget, graphBudget, episodicBudget } = splitBudget(tokenBudget, cfg);
+
+          const { db } = sessions.getSessionResources(sessionId, sessionKey, agentId);
+          const activeNodes = getBySession(db, sessionId);
+          const activeEdges = activeNodes.flatMap((n) => [
+            ...edgesFrom(db, n.id),
+            ...edgesTo(db, n.id),
+          ]);
+          const rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
+          const { tokens: gmTokens } = assembleContext(db, {
+            tokenBudget: graphBudget,
+            episodicTokenBudget: episodicBudget,
+            activeNodes,
+            activeEdges,
+            recalledNodes: rec.nodes,
+            recalledEdges: rec.edges,
+          });
+
+          // Upper bound: messages capped to msgBudget + graph + episodic.
+          // Never claim an after-size larger than before.
+          const msgCap = msgBudget && msgBudget > 0 ? msgBudget : tokensBefore;
+          const projected = Math.min(tokensBefore || Number.MAX_SAFE_INTEGER, msgCap) + gmTokens;
+          const tokensAfter = tokensBefore > 0 ? Math.min(tokensBefore, projected) : projected;
+
+          // Only claim compacted:true if we actually shrunk (or extracted fresh nodes
+          // that will let future recalls replace raw messages).
+          const didShrink = tokensBefore > 0 && tokensAfter < tokensBefore;
+          const didExtract = counts.nodes > 0 || counts.edges > 0;
 
           api.logger.info(
             `[graph-memory] compact: extracted ${counts.nodes} nodes, ${counts.edges} edges; ` +
-            `tokensBefore=${tokensBefore} tokensAfter~${tokensAfter} (assemble will apply trim)`,
+            `tokensBefore=${tokensBefore} tokensAfter~${tokensAfter} ` +
+            `(msgCap ${msgCap}, graph+episodic ${gmTokens})`,
           );
 
           return {
-            ok: true, compacted: true,
+            ok: true,
+            compacted: didShrink || didExtract,
             result: {
               summary: `extracted ${counts.nodes} nodes, ${counts.edges} edges`,
               tokensBefore,

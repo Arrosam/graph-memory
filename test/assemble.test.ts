@@ -108,30 +108,57 @@ describe("assembleContext", () => {
     expect(xml).toContain('source="recalled"');
   });
 
-  it("token 预算不截断节点（全量放入）", () => {
+  it("tokenBudget>0 时按预算截断节点", () => {
     // 插入很多大节点
     const nodes: GmNode[] = [];
     for (let i = 0; i < 20; i++) {
       const id = insertNode(db, {
         name: `skill-${i}`,
-        content: "x".repeat(5000), // 每个节点 5000 字符
+        content: "x".repeat(5000), // 每个节点 ~1700 tokens
       });
       nodes.push(findById(db, id)!);
     }
 
-    // 很小的 token 预算
+    // 很小的 token 预算应该触发截断
     const { xml } = assembleContext(db, {
-      tokenBudget: 1000, // 1000 * 0.15 * 3 = 450 字符
+      tokenBudget: 3000,
       activeNodes: nodes,
       activeEdges: [],
       recalledNodes: [],
       recalledEdges: [],
     });
 
-    // 不应该包含所有 20 个节点
+    // 至少保留一个节点，但远少于 20
+    expect(xml).not.toBeNull();
     if (xml) {
       const matches = xml.match(/name="skill-/g);
-      expect(matches!.length).toBe(20);
+      expect(matches!.length).toBeGreaterThan(0);
+      expect(matches!.length).toBeLessThan(20);
+    }
+  });
+
+  it("tokenBudget=0 表示不截断（遗留语义）", () => {
+    const nodes: GmNode[] = [];
+    for (let i = 0; i < 10; i++) {
+      const id = insertNode(db, {
+        name: `skill-${i}`,
+        content: "x".repeat(500),
+      });
+      nodes.push(findById(db, id)!);
+    }
+
+    const { xml } = assembleContext(db, {
+      tokenBudget: 0,
+      activeNodes: nodes,
+      activeEdges: [],
+      recalledNodes: [],
+      recalledEdges: [],
+    });
+
+    expect(xml).not.toBeNull();
+    if (xml) {
+      const matches = xml.match(/name="skill-/g);
+      expect(matches!.length).toBe(10);
     }
   });
 });
