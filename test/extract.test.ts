@@ -343,6 +343,48 @@ describe("LLM 输出格式容错", () => {
     expect(result.nodes).toHaveLength(0);
     expect(result.edges).toHaveLength(0);
   });
+
+  it("容忍字符串字面量中未转义的换行（弱模型常见）", async () => {
+    // 真实的 \n 字节，不是转义序列 —— 模拟 astron-low 等模型的输出
+    const raw = '{"nodes":[{"type":"TASK","name":"recycle-stale-sessions","description":"清理过期会话","content":"recycle-stale-sessions\n目标: 清理 timeout/done 状态的会话\n步骤:\n1. sessions_list\n2. 过滤状态"}],"edges":[]}';
+    const ext = createExtractor(raw);
+
+    const result = await ext.extract({ messages: [], existingNames: [] });
+
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0].content).toContain("\n");
+    expect(result.nodes[0].content).toContain("sessions_list");
+  });
+
+  it("容忍字符串字面量中未转义的 tab / 回车", async () => {
+    const raw = '{"nodes":[{"type":"SKILL","name":"t","description":"d","content":"a\tb\rc"}],"edges":[]}';
+    const ext = createExtractor(raw);
+
+    const result = await ext.extract({ messages: [], existingNames: [] });
+
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0].content).toBe("a\tb\rc");
+  });
+
+  it("格式化 JSON（token 间的换行）仍正常解析，不被 sanitizer 破坏", async () => {
+    const pretty = `{
+  "nodes": [
+    {
+      "type": "SKILL",
+      "name": "pretty-skill",
+      "description": "d",
+      "content": "## pretty"
+    }
+  ],
+  "edges": []
+}`;
+    const ext = createExtractor(pretty);
+
+    const result = await ext.extract({ messages: [], existingNames: [] });
+
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0].name).toBe("pretty-skill");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════
