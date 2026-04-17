@@ -222,14 +222,37 @@ const graphMemoryPlugin = {
         if (!prompt) return;
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
+        // Tool-loop short-circuit: if the host supplied messages and the last
+        // one is a tool result, we're mid tool-call chain — the user prompt
+        // hasn't changed since turn start, so don't re-embed.
+        const msgs = Array.isArray(event?.messages) ? event.messages : null;
+        if (msgs && msgs.length) {
+          const last = msgs[msgs.length - 1];
+          const role = last?.role;
+          if (role === "tool" || role === "toolResult" || role === "tool_result") {
+            return;
+          }
+        }
+
+        // Hash guard: dedupe across turns (tool-loop and repeated builds).
+        // Without this, every host re-invocation awaits a full embed + search
+        // even when the user prompt hasn't changed.
+        const sid = ctx?.sessionId;
+        const h = hashPrompt(prompt);
+        if (sid && recallPromptHash.get(sid) === h) {
+          return; // already recalled this exact prompt for this session
+        }
+
         api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
         const { recaller } = sessions.getAgentResources(ctx?.agentId);
         const res = await recaller.recall(prompt);
+        if (sid) recallPromptHash.set(sid, h);
         if (res.nodes.length) {
-          if (ctx?.sessionId) recalled.set(ctx.sessionId, res);
-          if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
+          if (sid) recalled.set(sid, res);
+          if (ctx?.sessionKey && ctx.sessionKey !== sid) {
             recalled.set(ctx.sessionKey, res);
+            recallPromptHash.set(ctx.sessionKey, h);
           }
           api.logger.info(
             `[graph-memory] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`,
