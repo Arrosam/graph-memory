@@ -113,6 +113,28 @@ export function createTestDb(): DatabaseSyncInstance {
     );
   `);
 
+  // m6: 社区描述
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_communities (
+      id          TEXT PRIMARY KEY,
+      summary     TEXT NOT NULL,
+      node_count  INTEGER NOT NULL DEFAULT 0,
+      embedding   BLOB,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+  `);
+
+  // m7: 节点-session 索引表
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_node_sessions (
+      node_id    TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      PRIMARY KEY (node_id, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_node_sessions_session ON gm_node_sessions(session_id);
+  `);
+
   return db;
 }
 
@@ -133,6 +155,7 @@ export function insertNode(
   },
 ): string {
   const id = opts.id ?? `n-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const sessions = opts.sessions ?? ["test-session"];
   db.prepare(`
     INSERT INTO gm_nodes (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -144,10 +167,15 @@ export function insertNode(
     opts.content ?? `content of ${opts.name}`,
     opts.status ?? "active",
     opts.validatedCount ?? 1,
-    JSON.stringify(opts.sessions ?? ["test-session"]),
+    JSON.stringify(sessions),
     Date.now(),
     Date.now(),
   );
+  // Mirror into gm_node_sessions so getBySession (which joins this table) works.
+  const insertSession = db.prepare(
+    "INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) VALUES (?, ?)",
+  );
+  for (const sid of sessions) insertSession.run(id, sid);
   return id;
 }
 

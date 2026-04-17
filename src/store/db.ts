@@ -84,7 +84,7 @@ export function closeDb(dbPath?: string): void {
 function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities];
+  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_node_sessions];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
@@ -221,4 +221,44 @@ function m6_communities(db: DatabaseSyncInstance): void {
       updated_at  INTEGER NOT NULL
     );
   `);
+}
+
+// ─── Node↔Session 索引表 ────────────────────────────────────
+//
+// 之前 getBySession 要扫 gm_nodes 并 json_each(source_sessions)——没索引，
+// 节点数一大就线性变慢。这张表把关系正规化，给 session_id 加索引，查询
+// 变成 index lookup。source_sessions JSON 字段保留作为权威存储，这张表
+// 由 upsertNode / mergeNodes 同步维护 + 迁移时首次回填。
+
+function m7_node_sessions(db: DatabaseSyncInstance): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_node_sessions (
+      node_id    TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      PRIMARY KEY (node_id, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_node_sessions_session ON gm_node_sessions(session_id);
+  `);
+
+  // Backfill from the existing JSON column.
+  const rows = db.prepare("SELECT id, source_sessions FROM gm_nodes").all() as Array<{
+    id: string; source_sessions: string;
+  }>;
+  const insert = db.prepare(
+    "INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) VALUES (?, ?)",
+  );
+  db.exec("BEGIN");
+  try {
+    for (const r of rows) {
+      let sessions: string[] = [];
+      try { sessions = JSON.parse(r.source_sessions ?? "[]"); } catch { /* skip bad JSON */ }
+      for (const sid of sessions) {
+        if (typeof sid === "string" && sid) insert.run(r.id, sid);
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }

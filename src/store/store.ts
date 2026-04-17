@@ -80,6 +80,8 @@ export function upsertNode(
     db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
       source_sessions=?, updated_at=? WHERE id=?`)
       .run(content, desc, count, sessions, Date.now(), ex.id);
+    db.prepare("INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) VALUES (?, ?)")
+      .run(ex.id, sessionId);
     return { node: { ...ex, content, description: desc, validatedCount: count }, isNew: false };
   }
 
@@ -88,6 +90,8 @@ export function upsertNode(
     (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
     VALUES (?,?,?,?,?,'active',1,?,?,?)`)
     .run(id, c.type, name, c.description, c.content, JSON.stringify([sessionId]), Date.now(), Date.now());
+  db.prepare("INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) VALUES (?, ?)")
+    .run(id, sessionId);
   return { node: findByName(db, name)!, isNew: true };
 }
 
@@ -113,6 +117,11 @@ export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: st
   db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
     source_sessions=?, updated_at=? WHERE id=?`)
     .run(content, desc, count, sessions, Date.now(), keepId);
+
+  // 同步 gm_node_sessions：把 merge 的所有关联移到 keep，再删 merge 的。
+  db.prepare("INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) SELECT ?, session_id FROM gm_node_sessions WHERE node_id=?")
+    .run(keepId, mergeId);
+  db.prepare("DELETE FROM gm_node_sessions WHERE node_id=?").run(mergeId);
 
   // 迁移边：mergeId 的边指向 keepId
   db.prepare("UPDATE gm_edges SET from_id=? WHERE from_id=?").run(keepId, mergeId);
@@ -281,9 +290,12 @@ export function graphWalk(
 // ─── 按 session 查询 ────────────────────────────────────────
 
 export function getBySession(db: DatabaseSyncInstance, sessionId: string): GmNode[] {
+  // Uses the gm_node_sessions index (session_id → node_id) instead of scanning
+  // gm_nodes + json_each. O(matches) instead of O(nodes * avg_sessions_per_node).
   return (db.prepare(`
-    SELECT DISTINCT n.* FROM gm_nodes n, json_each(n.source_sessions) j
-    WHERE j.value = ? AND n.status = 'active'
+    SELECT n.* FROM gm_nodes n
+    JOIN gm_node_sessions s ON s.node_id = n.id
+    WHERE s.session_id = ? AND n.status = 'active'
   `).all(sessionId) as any[]).map(toNode);
 }
 
