@@ -97,6 +97,11 @@ const graphMemoryPlugin = {
     const extractChain = new Map<string, Promise<unknown>>();
     // Recall is expensive (embed + FTS); skip if the same prompt already recalled.
     const recallPromptHash = new Map<string, string>();
+    // Sessions where the host does NOT route per-message engine.ingest (only
+    // afterTurn fires). The plugin takes over message persistence so extraction
+    // isn't starved. Membership is a one-way flip per session, decided on the
+    // first afterTurn that sees newMsgs>0 while msgSeq is still 0.
+    const afterTurnSaveMode = new Set<string>();
 
     // Non-crypto-strong but collision-resistant enough for cache dedupe.
     // Use SHA-256 prefix — DJB2's 32-bit space gets crowded on long prompts.
@@ -145,6 +150,7 @@ const graphMemoryPlugin = {
         recalled.delete(k);
         recallPromptHash.delete(k);
         turnCounter.delete(k);
+        afterTurnSaveMode.delete(k);
       }
     }
 
@@ -492,6 +498,32 @@ const graphMemoryPlugin = {
           `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
         );
 
+        // Detect hosts that don't route per-message engine.ingest. When the
+        // first afterTurn arrives with newMsgs>0 but msgSeq is still 0, the
+        // plugin's ingest was never called — extraction would starve because
+        // gm_messages is empty. Flip into afterTurn-persistence mode for this
+        // session so subsequent turns always persist before extracting.
+        if (
+          !afterTurnSaveMode.has(sessionId)
+          && totalMsgs === 0
+          && newMessages.length > 0
+        ) {
+          afterTurnSaveMode.add(sessionId);
+          api.logger.info(
+            `[graph-memory] afterTurn taking over message persistence for sid=${sessionId.slice(0, 8)} (host didn't route ingest)`,
+          );
+        }
+
+        if (afterTurnSaveMode.has(sessionId)) {
+          for (const m of newMessages) {
+            try {
+              ingestMessage(sessionId, m, sessionKey, agentId);
+            } catch (err) {
+              api.logger.warn(`[graph-memory] afterTurn ingestMessage failed: ${err}`);
+            }
+          }
+        }
+
         runTurnExtract(sessionId, newMessages, sessionKey, agentId).catch((err) => {
           api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
@@ -563,6 +595,7 @@ const graphMemoryPlugin = {
         recalled.clear();
         recallPromptHash.clear();
         turnCounter.clear();
+        afterTurnSaveMode.clear();
         sessions.dispose();
       },
     };
