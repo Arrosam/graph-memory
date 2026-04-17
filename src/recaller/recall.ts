@@ -42,9 +42,20 @@ export class Recaller {
   async recall(query: string): Promise<RecallResult> {
     const limit = this.cfg.recallMaxNodes;
 
-    // ── 两条路径各自独立跑满，不分配额 ──────────────────
-    const precise = await this.recallPrecise(query, limit);
-    const generalized = await this.recallGeneralized(query, limit);
+    // Share a single embedding across both paths — avoids hitting the embed
+    // API twice per recall (was latency-doubling).
+    let sharedVec: number[] | null = null;
+    if (this.embed) {
+      try {
+        sharedVec = await this.embed(query);
+      } catch { /* embed failed; both paths will fall back to FTS/reps */ }
+    }
+
+    // ── 两条路径并行跑，latency 取 max 而不是 sum ──────
+    const [precise, generalized] = await Promise.all([
+      this.recallPrecise(query, limit, sharedVec),
+      this.recallGeneralized(query, limit, sharedVec),
+    ]);
 
     // ── 合并去重（全部保留，只去重复节点） ────────────────
     const merged = this.mergeResults(precise, generalized);
@@ -60,13 +71,12 @@ export class Recaller {
   /**
    * 精确召回：向量/FTS5 找种子 → 社区扩展 → 图遍历 → PPR 排序
    */
-  private async recallPrecise(query: string, limit: number): Promise<RecallResult> {
+  private async recallPrecise(query: string, limit: number, sharedVec?: number[] | null): Promise<RecallResult> {
     let seeds: GmNode[] = [];
 
-    if (this.embed) {
+    if (sharedVec) {
       try {
-        const vec = await this.embed(query);
-        const scored = vectorSearchWithScore(this.db, vec, Math.ceil(limit / 2));
+        const scored = vectorSearchWithScore(this.db, sharedVec, Math.ceil(limit / 2));
         seeds = scored.map(s => s.node);
 
         if (process.env.GM_DEBUG && scored.length > 0) {
@@ -134,14 +144,13 @@ export class Recaller {
    * 有社区向量时：query vs 社区 embedding 匹配，按相似度排序社区
    * 无社区向量时：fallback 到 communityRepresentatives（按时间取代表节点）
    */
-  private async recallGeneralized(query: string, limit: number): Promise<RecallResult> {
+  private async recallGeneralized(query: string, limit: number, sharedVec?: number[] | null): Promise<RecallResult> {
     let seeds: GmNode[] = [];
 
     // 优先用社区向量搜索
-    if (this.embed) {
+    if (sharedVec) {
       try {
-        const vec = await this.embed(query);
-        const scoredCommunities = communityVectorSearch(this.db, vec);
+        const scoredCommunities = communityVectorSearch(this.db, sharedVec);
 
         if (scoredCommunities.length > 0) {
           const communityIds = scoredCommunities.map(c => c.id);
