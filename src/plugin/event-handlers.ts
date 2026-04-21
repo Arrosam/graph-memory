@@ -46,7 +46,7 @@ function registerSessionStart({ api, sessions }: EventHandlersDeps): void {
       return;
     }
     try {
-      sessions.getAgentResources(ctx?.agentId);
+      sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
     } catch (err) {
       api.logger.warn(`[graph-memory] session_start DB warm-up failed: ${err}`);
     }
@@ -91,7 +91,7 @@ function registerBeforePromptBuild({ api, sessions, state }: EventHandlersDeps):
 
       api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
-      const { recaller } = sessions.getAgentResources(ctx?.agentId);
+      const { recaller } = sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
       const res = await recaller.recall(prompt);
       if (sid) state.recallPromptHash.set(sid, h);
       if (res.nodes.length && sid) state.recalled.set(sid, res);
@@ -127,7 +127,7 @@ function registerSessionEnd(deps: EventHandlersDeps): void {
     }
 
     try {
-      const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
+      const { db, recaller } = sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
       const nodes = getBySession(db, sid);
       if (nodes.length) {
         const summary = (

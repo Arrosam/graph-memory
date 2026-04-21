@@ -24,6 +24,13 @@ export interface Logger {
 
 export class SessionManager {
   private sessionAgentMap = new Map<string, string>();
+  /**
+   * Subagent child keys mapped to their parent's agentId. Set by
+   * propagateSession() when a subagent is spawned, and takes precedence over
+   * any explicit agentId the child later presents. Ensures the child opens
+   * the parent's DB so compaction / extraction share one graph.
+   */
+  private subagentOverride = new Map<string, string>();
   private agentCache = new Map<string, AgentResources>();
   private sharedEmbedFn: EmbedFn | null = null;
 
@@ -46,6 +53,8 @@ export class SessionManager {
    * cfg fallback, previously-bound session map, or sessionKey pattern.
    */
   canResolveAgent(sessionId?: string, sessionKey?: string, agentId?: string): boolean {
+    if (sessionKey && this.subagentOverride.has(sessionKey)) return true;
+    if (sessionId && this.subagentOverride.has(sessionId)) return true;
     if (agentId?.trim()) return true;
     if (this.cfg.agentId?.trim()) return true;
     if (sessionKey && this.sessionAgentMap.has(sessionKey)) return true;
@@ -58,8 +67,16 @@ export class SessionManager {
   bindSession(ctx: any): void {
     const aid = ctx?.agentId?.trim();
     if (!aid) return;
-    if (ctx.sessionId) this.sessionAgentMap.set(ctx.sessionId, aid);
-    if (ctx.sessionKey && ctx.sessionKey !== ctx.sessionId) {
+    // Subagent override is authoritative — don't let the child's own agentId
+    // clobber the parent binding propagated via prepareSubagentSpawn.
+    if (ctx.sessionId && !this.subagentOverride.has(ctx.sessionId)) {
+      this.sessionAgentMap.set(ctx.sessionId, aid);
+    }
+    if (
+      ctx.sessionKey
+      && ctx.sessionKey !== ctx.sessionId
+      && !this.subagentOverride.has(ctx.sessionKey)
+    ) {
       this.sessionAgentMap.set(ctx.sessionKey, aid);
     }
   }
@@ -96,9 +113,9 @@ export class SessionManager {
   }
 
   /** Get DB + Recaller for a session, resolving the agentId from multiple sources. */
-  getSessionResources(sessionId: string, sessionKey?: string, agentId?: string): AgentResources {
+  getSessionResources(sessionId?: string, sessionKey?: string, agentId?: string): AgentResources {
     const resolved = this.resolveAgentId(sessionId, sessionKey, agentId);
-    if (resolved && !this.sessionAgentMap.has(sessionId)) {
+    if (resolved && sessionId && !this.sessionAgentMap.has(sessionId)) {
       this.sessionAgentMap.set(sessionId, resolved);
       if (sessionKey && sessionKey !== sessionId) {
         this.sessionAgentMap.set(sessionKey, resolved);
@@ -107,30 +124,51 @@ export class SessionManager {
     return this.getAgentResources(resolved);
   }
 
-  /** Propagate agent binding from parent session to child session. */
+  /**
+   * Propagate agent binding from parent session to child session. Also
+   * records the child as a subagent so future explicit-agentId arguments
+   * can't redirect it to a different DB.
+   */
   propagateSession(parentKey: string, childKey: string): void {
     const parentAgent = this.sessionAgentMap.get(parentKey);
-    if (parentAgent) this.sessionAgentMap.set(childKey, parentAgent);
+    if (!parentAgent) return;
+    this.sessionAgentMap.set(childKey, parentAgent);
+    this.subagentOverride.set(childKey, parentAgent);
   }
 
   /** Clean up session-agent mappings for a given session. */
   cleanupSession(sessionId?: string, sessionKey?: string): void {
-    if (sessionId) this.sessionAgentMap.delete(sessionId);
-    if (sessionKey) this.sessionAgentMap.delete(sessionKey);
+    if (sessionId) {
+      this.sessionAgentMap.delete(sessionId);
+      this.subagentOverride.delete(sessionId);
+    }
+    if (sessionKey) {
+      this.sessionAgentMap.delete(sessionKey);
+      this.subagentOverride.delete(sessionKey);
+    }
   }
 
   /** Release all resources. */
   dispose(): void {
     this.sessionAgentMap.clear();
+    this.subagentOverride.clear();
     this.agentCache.clear();
   }
 
-  /** Resolve agentId: explicit → sessionAgentMap → sessionKey pattern → undefined */
+  /**
+   * Resolve agentId. Subagent override wins over explicit agentId so that a
+   * spawned child always lands on its parent's DB, even if the host passes
+   * the child a distinct agentId.
+   */
   private resolveAgentId(
     sessionId?: string,
     sessionKey?: string,
     explicitAgentId?: string,
   ): string | undefined {
+    const override =
+      (sessionKey ? this.subagentOverride.get(sessionKey) : undefined) ||
+      (sessionId ? this.subagentOverride.get(sessionId) : undefined);
+    if (override) return override;
     return (
       explicitAgentId?.trim() ||
       (sessionKey ? this.sessionAgentMap.get(sessionKey) : undefined) ||

@@ -52,7 +52,7 @@ export function createContextEngine(deps: ContextEngineDeps) {
       // Eagerly open the agent DB here too — bootstrap runs before any
       // context-engine call, so this is the right moment to pay the cost.
       try {
-        sessions.getAgentResources(agentId);
+        sessions.getSessionResources(sessionId, sessionKey, agentId);
       } catch (err) {
         api.logger.warn(`[graph-memory] bootstrap DB warm-up failed: ${err}`);
       }

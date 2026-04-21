@@ -47,7 +47,7 @@ function registerSearchTool(api: OpenClawPluginApi, sessions: SessionManager): v
             details: { error: "no_agent_id", query },
           };
         }
-        const { recaller } = sessions.getAgentResources(ctx?.agentId);
+        const { recaller } = sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
         const res = await recaller.recall(query);
         if (!res.nodes.length) {
           return {
@@ -108,7 +108,7 @@ function registerRecordTool(api: OpenClawPluginApi, sessions: SessionManager): v
             details: { error: "no_agent_id" },
           };
         }
-        const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
+        const { db, recaller } = sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
         const nodeType = normalizeNodeType(p.type);
         if (!nodeType) {
           return {
@@ -160,7 +160,7 @@ function registerStatsTool(api: OpenClawPluginApi, sessions: SessionManager): vo
             details: { error: "no_agent_id" },
           };
         }
-        const { db } = sessions.getAgentResources(ctx?.agentId);
+        const { db } = sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
         const stats = getStats(db);
         const topPr = db
           .prepare(
@@ -206,7 +206,7 @@ function registerMaintainTool(
             details: { error: "no_agent_id" },
           };
         }
-        const { db, recaller } = sessions.getAgentResources(ctx?.agentId);
+        const { db, recaller } = sessions.getSessionResources(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId);
         const embedFn = recaller.getEmbedFn() ?? undefined;
         const result = await runMaintenance(db, cfg, llm, embedFn);
         const text = [
