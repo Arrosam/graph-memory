@@ -88,7 +88,14 @@ export class SessionContext {
     if (!Array.isArray(msgs) || !msgs.length) return false;
     const last = (msgs as any[])[msgs.length - 1];
     const role = last?.role;
-    return role === "tool" || role === "toolResult" || role === "tool_result";
+    if (role === "tool" || role === "toolResult" || role === "tool_result") return true;
+    // Anthropic format: tool results are role="user" with tool_result content blocks.
+    if (role === "user" && Array.isArray(last?.content)) {
+      return last.content.some((b: any) =>
+        b?.type === "tool_result" || b?.type === "toolResult"
+      );
+    }
+    return false;
   }
 
   /** Delete entries from every state map under every provided key. */
