@@ -59,28 +59,19 @@ export function createContextEngine(deps: ContextEngineDeps) {
       return { bootstrapped: true };
     },
 
-    async ingest({
-      sessionId, sessionKey, message, isHeartbeat, agentId, ...rest
-    }: {
-      sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean; agentId?: string; [k: string]: any;
+    /**
+     * Required by the ContextEngine type, but intentionally a no-op here.
+     *
+     * OpenClaw's runner picks afterTurn xor ingest — if afterTurn is defined,
+     * ingest is never called. This engine handles ALL message persistence in
+     * afterTurn. Keeping this method as a stub guarantees that even if a
+     * future host or runtime change starts calling ingest, we won't end up
+     * double-writing each message under two different turn_indexes.
+     */
+    async ingest(_params: {
+      sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean;
     }) {
-      if (isHeartbeat) return { ingested: false };
-      if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) {
-        return { ingested: false };
-      }
-      if (!sessions.hasSession(sessionId)) {
-        const extraKeys = Object.keys(rest).join(",");
-        api.logger.info(
-          `[graph-memory] ingest first-seen sid=${sessionId.slice(0, 8)} agentId=${agentId ?? "∅"} sessionKey=${(sessionKey ?? "∅").slice(0, 30)} extraKeys=[${extraKeys}]`,
-        );
-      }
-      try {
-        state.ingestMessage(sessionId, message, sessionKey, agentId);
-      } catch (err) {
-        api.logger.warn(`[graph-memory] ingest failed: ${err}`);
-        return { ingested: false };
-      }
-      return { ingested: true };
+      return { ingested: false };
     },
 
     async assemble({
@@ -262,34 +253,18 @@ export function createContextEngine(deps: ContextEngineDeps) {
       if (!sessions.canResolveAgent(sessionId, sessionKey, agentId)) return;
 
       const newMessages = messages.slice(prePromptMessageCount ?? 0);
-      const totalMsgs = state.msgSeq.get(sessionId) ?? 0;
       api.logger.info(
-        `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
+        `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length}`,
       );
 
-      // Detect hosts that don't route per-message engine.ingest. When the
-      // first afterTurn arrives with newMsgs>0 but msgSeq is still 0, the
-      // plugin's ingest was never called — extraction would starve because
-      // gm_messages is empty. Flip into afterTurn-persistence mode for this
-      // session so subsequent turns always persist before extracting.
-      if (
-        !state.afterTurnSaveMode.has(sessionId)
-        && totalMsgs === 0
-        && newMessages.length > 0
-      ) {
-        state.afterTurnSaveMode.add(sessionId);
-        api.logger.info(
-          `[graph-memory] afterTurn taking over message persistence for sid=${sessionId.slice(0, 8)} (host didn't route ingest)`,
-        );
-      }
-
-      if (state.afterTurnSaveMode.has(sessionId)) {
-        for (const m of newMessages) {
-          try {
-            state.ingestMessage(sessionId, m, sessionKey, agentId);
-          } catch (err) {
-            api.logger.warn(`[graph-memory] afterTurn ingestMessage failed: ${err}`);
-          }
+      // OpenClaw routes per-turn via afterTurn xor per-message via ingest —
+      // never both. Since this engine defines afterTurn, ingest is never
+      // called by the host, so afterTurn is the sole persistence path.
+      for (const m of newMessages) {
+        try {
+          state.ingestMessage(sessionId, m, sessionKey, agentId);
+        } catch (err) {
+          api.logger.warn(`[graph-memory] afterTurn ingestMessage failed: ${err}`);
         }
       }
 

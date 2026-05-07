@@ -40,8 +40,6 @@ export class SessionContext {
   readonly extractChain = new Map<string, Promise<unknown>>();
   /** recall is expensive; skip if same prompt already recalled */
   readonly recallPromptHash = new Map<string, string>();
-  /** sessions where the host doesn't route engine.ingest — afterTurn persists */
-  readonly afterTurnSaveMode = new Set<string>();
 
   constructor(private deps: SessionContextDeps) {}
 
@@ -107,7 +105,6 @@ export class SessionContext {
       this.recalled.delete(k);
       this.recallPromptHash.delete(k);
       this.turnCounter.delete(k);
-      this.afterTurnSaveMode.delete(k);
     }
   }
 
@@ -169,7 +166,6 @@ export class SessionContext {
     this.recalled.clear();
     this.recallPromptHash.clear();
     this.turnCounter.clear();
-    this.afterTurnSaveMode.clear();
     this.deps.sessions.dispose();
   }
 }
