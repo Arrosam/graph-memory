@@ -11,7 +11,10 @@ import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 export function migrate(db: DatabaseSyncInstance): void {
   db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
   const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities, m7_node_sessions];
+  const steps = [
+    m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities,
+    m7_node_sessions, m8_messages_unique,
+  ];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
@@ -183,6 +186,37 @@ function m7_node_sessions(db: DatabaseSyncInstance): void {
         if (typeof sid === "string" && sid) insert.run(r.id, sid);
       }
     }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+// ─── 消息表 (session_id, turn_index) 唯一索引 ───────────────
+//
+// gm_messages had only `id PRIMARY KEY` (random uid), so saveMessage's
+// `INSERT OR IGNORE` never deduped on logical key. afterTurn replays /
+// host retries could write the same turn twice, double-feeding extraction.
+// This migration drops dups (keep earliest created_at, then smallest id),
+// then adds the unique index that saveMessage relies on.
+
+function m8_messages_unique(db: DatabaseSyncInstance): void {
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      DELETE FROM gm_messages WHERE id NOT IN (
+        SELECT id FROM gm_messages
+        WHERE rowid IN (
+          SELECT MIN(rowid) FROM gm_messages
+          GROUP BY session_id, turn_index
+        )
+      );
+    `);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_msg_sid_turn
+      ON gm_messages(session_id, turn_index);
+    `);
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");

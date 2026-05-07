@@ -110,11 +110,12 @@ export async function drainExtractAndPersist(
   const edgeDetailsAll: string[] = [];
   let batches = 0;
 
-  for (; batches < maxBatches; batches++) {
+  for (let attempt = 0; attempt < maxBatches; attempt++) {
     const msgs = getUnextracted(db, sessionId, batchSize);
     if (!msgs.length) break;
 
     const r = await extractAndPersist(db, recaller, extractor, sessionId, msgs);
+    batches++;
     totalNodes += r.nodesExtracted;
     totalEdges += r.edgesExtracted;
     if (r.nodeDetails) nodeDetailsAll.push(r.nodeDetails);
@@ -129,6 +130,6 @@ export async function drainExtractAndPersist(
     edgesExtracted: totalEdges,
     nodeDetails: nodeDetailsAll.join(" | "),
     edgeDetails: edgeDetailsAll.join(" | "),
-    batches: batches + (totalNodes || totalEdges ? 1 : 0),
+    batches,
   };
 }

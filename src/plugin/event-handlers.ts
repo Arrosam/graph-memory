@@ -113,8 +113,11 @@ function registerSessionEnd(deps: EventHandlersDeps): void {
 
   api.on("session_end", async (event: any, ctx: any) => {
     sessions.bindSession(ctx);
+    // sessionId-first to match ingest/assemble/extract — otherwise finalize
+    // tags promotedSkills/newEdges under sessionKey but assemble queries by
+    // sessionId, leaving fresh nodes invisible to the next turn.
     const sid =
-      ctx?.sessionKey ?? ctx?.sessionId ?? event?.sessionKey ?? event?.sessionId;
+      ctx?.sessionId ?? ctx?.sessionKey ?? event?.sessionId ?? event?.sessionKey;
     if (!sid) return;
 
     // No agentId ever bound to this session → nothing to finalize. Clean

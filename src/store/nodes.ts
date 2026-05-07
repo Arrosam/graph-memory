@@ -67,7 +67,8 @@ export function deprecate(db: DatabaseSyncInstance, nodeId: string): void {
     .run(Date.now(), nodeId);
 }
 
-/** 合并两个节点：keepId 保留，mergeId 标记 deprecated，边迁移 */
+/** 合并两个节点：keepId 保留，mergeId 标记 deprecated，边迁移。
+ *  整体在事务里，避免崩溃留下半合并的图。 */
 export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: string): void {
   const keep = findById(db, keepId);
   const merge = findById(db, mergeId);
@@ -81,30 +82,41 @@ export function mergeNodes(db: DatabaseSyncInstance, keepId: string, mergeId: st
   const content = keep.content.length >= merge.content.length ? keep.content : merge.content;
   const desc = keep.description.length >= merge.description.length ? keep.description : merge.description;
 
-  db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
-    source_sessions=?, updated_at=? WHERE id=?`)
-    .run(content, desc, count, sessions, Date.now(), keepId);
+  db.exec("BEGIN");
+  try {
+    db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
+      source_sessions=?, updated_at=? WHERE id=?`)
+      .run(content, desc, count, sessions, Date.now(), keepId);
 
-  // 同步 gm_node_sessions：把 merge 的所有关联移到 keep，再删 merge 的。
-  db.prepare("INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) SELECT ?, session_id FROM gm_node_sessions WHERE node_id=?")
-    .run(keepId, mergeId);
-  db.prepare("DELETE FROM gm_node_sessions WHERE node_id=?").run(mergeId);
+    // 同步 gm_node_sessions：把 merge 的所有关联移到 keep，再删 merge 的。
+    db.prepare("INSERT OR IGNORE INTO gm_node_sessions (node_id, session_id) SELECT ?, session_id FROM gm_node_sessions WHERE node_id=?")
+      .run(keepId, mergeId);
+    db.prepare("DELETE FROM gm_node_sessions WHERE node_id=?").run(mergeId);
 
-  // 迁移边：mergeId 的边指向 keepId
-  db.prepare("UPDATE gm_edges SET from_id=? WHERE from_id=?").run(keepId, mergeId);
-  db.prepare("UPDATE gm_edges SET to_id=? WHERE to_id=?").run(keepId, mergeId);
+    // 迁移边：mergeId 的边指向 keepId
+    db.prepare("UPDATE gm_edges SET from_id=? WHERE from_id=?").run(keepId, mergeId);
+    db.prepare("UPDATE gm_edges SET to_id=? WHERE to_id=?").run(keepId, mergeId);
 
-  // 删除自环（合并后可能出现 keepId → keepId）
-  db.prepare("DELETE FROM gm_edges WHERE from_id = to_id").run();
+    // 删除自环（合并后可能出现 keepId → keepId）
+    db.prepare("DELETE FROM gm_edges WHERE from_id = to_id").run();
 
-  // 删除重复边（同 from+to+type 只保留一条）
-  db.prepare(`
-    DELETE FROM gm_edges WHERE id NOT IN (
-      SELECT MIN(id) FROM gm_edges GROUP BY from_id, to_id, type
-    )
-  `).run();
+    // 删除重复边（同 from+to+type 只保留一条）
+    db.prepare(`
+      DELETE FROM gm_edges WHERE id NOT IN (
+        SELECT MIN(id) FROM gm_edges GROUP BY from_id, to_id, type
+      )
+    `).run();
 
-  deprecate(db, mergeId);
+    // 释放被合并节点的向量行：deprecated 节点不会再被搜索，留着只是磁盘垃圾。
+    db.prepare("DELETE FROM gm_vectors WHERE node_id=?").run(mergeId);
+
+    db.prepare("UPDATE gm_nodes SET status='deprecated', updated_at=? WHERE id=?")
+      .run(Date.now(), mergeId);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 /** 批量更新 PageRank 分数 */

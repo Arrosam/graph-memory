@@ -7,7 +7,8 @@
 
 import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
-import { toNode, toEdge } from "./common.ts";
+import { toNode, toEdge, chunked } from "./common.ts";
+import { blobToFloat32 } from "./vectors.ts";
 
 // ─── FTS5 能力探测 ───────────────────────────────────────────
 
@@ -90,14 +91,34 @@ export function graphWalk(
   const nodeIds = walkRows.map((r: any) => r.node_id);
   if (!nodeIds.length) return { nodes: [], edges: [] };
 
-  const np = nodeIds.map(() => "?").join(",");
-  const nodes = (db.prepare(`
-    SELECT * FROM gm_nodes WHERE id IN (${np}) AND status='active'
-  `).all(...nodeIds) as any[]).map(toNode);
+  const nodes: GmNode[] = [];
+  const edgeRows: any[] = [];
+  for (const chunk of chunked(nodeIds, 500)) {
+    const np = chunk.map(() => "?").join(",");
+    const nodeRows = db.prepare(`
+      SELECT * FROM gm_nodes WHERE id IN (${np}) AND status='active'
+    `).all(...chunk) as any[];
+    nodes.push(...nodeRows.map(toNode));
+  }
 
-  const edges = (db.prepare(`
-    SELECT * FROM gm_edges WHERE from_id IN (${np}) AND to_id IN (${np})
-  `).all(...nodeIds, ...nodeIds) as any[]).map(toEdge);
+  // Edges need both endpoints in the visited set. The simplest correct
+  // approach without temp tables: pull every edge from each chunk and filter
+  // client-side to those whose other endpoint is also in nodeIds.
+  const idSet = new Set(nodeIds);
+  for (const chunk of chunked(nodeIds, 500)) {
+    const np = chunk.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT * FROM gm_edges WHERE from_id IN (${np}) OR to_id IN (${np})
+    `).all(...chunk, ...chunk) as any[];
+    for (const r of rows) {
+      if (idSet.has(r.from_id) && idSet.has(r.to_id)) edgeRows.push(r);
+    }
+  }
+  // Dedup edges (an edge can match in two chunks if both endpoints are split).
+  const seen = new Set<string>();
+  const edges = edgeRows
+    .filter(r => seen.has(r.id) ? false : (seen.add(r.id), true))
+    .map(toEdge);
 
   return { nodes, edges };
 }
@@ -121,8 +142,7 @@ export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number
 
   return rows
     .map(row => {
-      const raw = row.embedding as Uint8Array;
-      const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+      const v = blobToFloat32(row.embedding as Uint8Array);
       let dot = 0, vNorm = 0;
       const len = Math.min(v.length, q.length);
       for (let i = 0; i < len; i++) {
@@ -196,8 +216,7 @@ export function communityVectorSearch(db: DatabaseSyncInstance, queryVec: number
 
   return rows
     .map(r => {
-      const raw = r.embedding as Uint8Array;
-      const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+      const v = blobToFloat32(r.embedding as Uint8Array);
       let dot = 0, vNorm = 0;
       const len = Math.min(v.length, q.length);
       for (let i = 0; i < len; i++) {
@@ -220,15 +239,19 @@ export function communityVectorSearch(db: DatabaseSyncInstance, queryVec: number
  */
 export function nodesByCommunityIds(db: DatabaseSyncInstance, communityIds: string[], perCommunity = 3): GmNode[] {
   if (!communityIds.length) return [];
-  const placeholders = communityIds.map(() => "?").join(",");
-  const rows = db.prepare(`
-    SELECT * FROM gm_nodes
-    WHERE community_id IN (${placeholders}) AND status='active'
-    ORDER BY community_id, updated_at DESC
-  `).all(...communityIds) as any[];
+  const allRows: any[] = [];
+  for (const chunk of chunked(communityIds, 500)) {
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT * FROM gm_nodes
+      WHERE community_id IN (${placeholders}) AND status='active'
+      ORDER BY community_id, updated_at DESC
+    `).all(...chunk) as any[];
+    allRows.push(...rows);
+  }
 
   const byCommunity = new Map<string, GmNode[]>();
-  for (const r of rows) {
+  for (const r of allRows) {
     const node = toNode(r);
     const cid = r.community_id as string;
     if (!byCommunity.has(cid)) byCommunity.set(cid, []);

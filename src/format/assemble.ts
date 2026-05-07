@@ -164,13 +164,13 @@ export function assembleContext(
 
   for (const [cid, members] of byCommunity) {
     const summary = getCommunitySummary(db, cid);
-    const label = summary ? escapeXml(summary.summary) : cid;
-    xmlParts.push(`  <community id="${cid}" desc="${label}">`);
+    const label = summary ? escapeXml(summary.summary) : escapeXml(cid);
+    xmlParts.push(`  <community id="${escapeXml(cid)}" desc="${label}">`);
     for (const n of members) {
       const tag = n.type.toLowerCase();
       const srcAttr = n.src === "recalled" ? ` source="recalled"` : "";
       const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-      xmlParts.push(`    <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
+      xmlParts.push(`    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${escapeXml(n.content.trim())}\n    </${tag}>`);
     }
     xmlParts.push(`  </community>`);
   }
@@ -180,7 +180,7 @@ export function assembleContext(
     const tag = n.type.toLowerCase();
     const srcAttr = n.src === "recalled" ? ` source="recalled"` : "";
     const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-    xmlParts.push(`  <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+    xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${escapeXml(n.content.trim())}\n  </${tag}>`);
   }
 
   const nodesXml = xmlParts.join("\n");
@@ -190,7 +190,7 @@ export function assembleContext(
         const fromName = idToName.get(e.fromId) ?? e.fromId;
         const toName = idToName.get(e.toId) ?? e.toId;
         const cond = e.condition ? ` when="${escapeXml(e.condition)}"` : "";
-        return `    <e type="${e.type}" from="${fromName}" to="${toName}"${cond}>${escapeXml(e.instruction)}</e>`;
+        return `    <e type="${e.type}" from="${escapeXml(fromName)}" to="${escapeXml(toName)}"${cond}>${escapeXml(e.instruction)}</e>`;
       }).join("\n")}\n  </edges>`
     : "";
 
@@ -222,7 +222,7 @@ export function assembleContext(
     const lines = msgs.map(m =>
       `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
     ).join("\n");
-    const chunk = `  <trace node="${node.name}">\n${lines}\n  </trace>`;
+    const chunk = `  <trace node="${escapeXml(node.name)}">\n${lines}\n  </trace>`;
     const chunkTok = Math.ceil(chunk.length / CHARS_PER_TOKEN);
 
     // 预算硬上限：超出就停（至少保留一条）

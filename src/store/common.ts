@@ -33,11 +33,23 @@ export function toEdge(r: any): GmEdge {
   };
 }
 
-/** 标准化 name：全小写，空格转连字符，保留中文 */
+/** Split an array into fixed-size chunks. Useful for SQL `IN (...)` queries
+ *  where the parameter list could exceed SQLITE_MAX_VARIABLE_NUMBER (32766
+ *  on modern builds, 999 on older ones). */
+export function chunked<T>(arr: T[], size = 500): T[][] {
+  if (arr.length <= size) return [arr];
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/** 标准化 name：全小写，空格转连字符。
+ *  保留所有 Unicode 字母 / 数字（Latin、CJK、Hiragana/Katakana、Hangul、
+ *  CJK Extension A 等），避免日韩或扩展区中文被剥光导致节点名退化为空串。 */
 export function normalizeName(name: string): string {
   return name.trim().toLowerCase()
     .replace(/[\s_]+/g, "-")
-    .replace(/[^a-z0-9\u4e00-\u9fff\-]/g, "")
+    .replace(/[^\p{L}\p{N}\-]/gu, "")
     .replace(/-{2,}/g, "-")
     .replace(/^-|-$/g, "");
 }

@@ -66,7 +66,8 @@ export function getDb(dbPath: string): DatabaseSyncInstance {
   return db;
 }
 
-/** 仅用于测试：关闭并重置单例（不传 path 则关闭全部） */
+/** Close cached SQLite handles. Pass a path to close one, or no args to close all.
+ *  Used by tests and by SessionManager.dispose() on plugin teardown / hot reload. */
 export function closeDb(dbPath?: string): void {
   if (dbPath) {
     const resolved = resolvePath(dbPath);

@@ -101,7 +101,10 @@ function registerRecordTool(api: OpenClawPluginApi, sessions: SessionManager): v
         _toolCallId: string,
         p: { name: string; type: string; description: string; content: string; relatedSkill?: string },
       ) {
-        const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+        // sessionId-first to match assemble's getBySession query — otherwise
+        // a node recorded mid-conversation won't appear in the same session's
+        // active context.
+        const sid = ctx?.sessionId ?? ctx?.sessionKey ?? "manual";
         if (!sessions.canResolveAgent(ctx?.sessionId, ctx?.sessionKey, ctx?.agentId)) {
           return {
             content: [{ type: "text", text: "graph-memory 未启用：当前上下文无 agentId。" }],

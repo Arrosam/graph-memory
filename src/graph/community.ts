@@ -24,8 +24,9 @@
  *   - kg_stats 展示社区分布
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import { updateCommunities } from "../store/nodes.ts";
+import { chunked } from "../store/common.ts";
 
 export interface CommunityResult {
   labels: Map<string, string>;
@@ -193,13 +194,22 @@ export async function summarizeCommunities(
   for (const [communityId, memberIds] of communities) {
     if (memberIds.length === 0) continue;
 
-    const placeholders = memberIds.map(() => "?").join(",");
-    const members = db.prepare(`
-      SELECT name, type, description FROM gm_nodes
-      WHERE id IN (${placeholders}) AND status='active'
-      ORDER BY validated_count DESC
-      LIMIT 10
-    `).all(...memberIds) as any[];
+    // Chunk IN(...) so very large communities don't trip
+    // SQLITE_MAX_VARIABLE_NUMBER. Combine chunks, then re-rank locally.
+    const memberRows: any[] = [];
+    for (const chunk of chunked(memberIds, 500)) {
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = db.prepare(`
+        SELECT name, type, description, validated_count FROM gm_nodes
+        WHERE id IN (${placeholders}) AND status='active'
+        ORDER BY validated_count DESC
+        LIMIT 10
+      `).all(...chunk) as any[];
+      memberRows.push(...rows);
+    }
+    const members = memberRows
+      .sort((a, b) => (b.validated_count ?? 0) - (a.validated_count ?? 0))
+      .slice(0, 10);
 
     if (members.length === 0) continue;
 

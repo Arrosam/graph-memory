@@ -8,7 +8,10 @@
 
 export function extractJson(raw: string): string {
   let s = raw.trim();
-  s = s.replace(/<think>[\s\S]*?<\/redacted_thinking>/gi, "");
+  // Strip closed <think>…</think> blocks first (non-greedy), then any leading
+  // unclosed <think>… tail. Doing it in this order avoids the greedy fallback
+  // eating a valid </think>{json} payload.
+  s = s.replace(/<think>[\s\S]*?<\/think>/gi, "");
   s = s.replace(/<think>[\s\S]*/gi, "");
   s = s.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?\s*```\s*$/i, "");
   s = s.trim();
