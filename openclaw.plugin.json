@@ -3,6 +3,14 @@
   "name": "Graph Memory",
   "version": "1.6.0",
   "description": "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+  "contracts": {
+    "tools": [
+      "gm_search",
+      "gm_record",
+      "gm_stats",
+      "gm_maintain"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "properties": {
