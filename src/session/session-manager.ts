@@ -6,7 +6,7 @@
  */
 
 import type { DatabaseSyncInstance } from "@photostructure/sqlite";
-import { getDb, resolveAgentDbPath, closeDb } from "../store/db.ts";
+import { getDb, resolveAgentDbPath } from "../store/db.ts";
 import { Recaller } from "../recaller/recall.ts";
 import type { GmConfig } from "../types.ts";
 import type { EmbedFn } from "../engine/embed.ts";
@@ -148,15 +148,16 @@ export class SessionManager {
     }
   }
 
-  /** Release all resources, closing every cached SQLite handle. */
+  /** Release per-session metadata. SQLite handles in db.ts's global cache
+   *  are intentionally left open: OpenClaw calls engine.dispose() in the
+   *  finally block of every agent run, so closing handles here breaks any
+   *  background work (extract, syncEmbed, maintenance) that outlives the
+   *  run. The handles are reused across runs via the path-keyed cache and
+   *  released when the process exits. */
   dispose(): void {
     this.sessionAgentMap.clear();
     this.subagentOverride.clear();
     this.agentCache.clear();
-    // closeDb() also clears db.ts's global _dbMap so future getDb() opens fresh.
-    try { closeDb(); } catch (err) {
-      this.logger.warn(`[graph-memory] closeDb on dispose failed: ${err}`);
-    }
   }
 
   /**
